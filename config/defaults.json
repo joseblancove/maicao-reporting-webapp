@@ -1,0 +1,15 @@
+{
+  "previous_month": {
+    "views": 13243953,
+    "reach": 8194876,
+    "interactions": 235679,
+    "er": 2.9,
+    "investment": 2130000,
+    "contents": 140
+  },
+  "official_platform_kpis": {
+    "Instagram": {"views": 8231124, "reach": 3962613, "interactions": 58723, "er": 1.4, "contents": 92, "budget": 1670000, "prev_budget": 850000, "stories": 68, "reels": 13, "carousels": 10},
+    "Facebook": {"views": 3223306, "reach": 1905477, "interactions": 4656, "er": 0.2, "contents": 31, "stories": 19, "reels": 9, "carousels": 2, "posts": 1},
+    "TikTok": {"views": 4522490, "reach": 1904830, "interactions": 17148, "er": 0.9, "contents": 25}
+  }
+}

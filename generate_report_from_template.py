@@ -1,0 +1,656 @@
+#!/usr/bin/env python3
+"""
+Generador Maicao Visual v04
+
+Mejoras v04:
+- Validacion automatica antes de generar: avisa datos faltantes por hoja/plataforma/mes.
+- Fallback visual: si falta un dato, la PPT muestra "Dato pendiente".
+- Ajuste de tarjetas KPI para evitar que "vs mes anterior" se monte sobre el numero.
+- Normalizacion de mes: acepta texto tipo "Marzo 2026" o fechas Excel tipo "mar-26".
+- KPIs por plataforma desde Excel: hoja 13_Platform_KPIs.
+
+Uso Terminal:
+  python3 generate_report_from_template.py
+
+Salida default:
+  output/Maicao_Reporte_Auto_Template_v04.pptx
+"""
+import argparse, json, re, sys
+from pathlib import Path
+from datetime import datetime, date
+from openpyxl import load_workbook
+from pptx import Presentation
+from pptx.util import Pt, Inches
+
+ROOT = Path(__file__).resolve().parent
+DEFAULTS_PATH = ROOT / "config" / "defaults.json"
+MISSING = "Dato pendiente"
+PLATFORMS = ["Instagram", "Facebook", "TikTok"]
+MONTHS_ES = {
+    1: "Enero", 2: "Febrero", 3: "Marzo", 4: "Abril", 5: "Mayo", 6: "Junio",
+    7: "Julio", 8: "Agosto", 9: "Septiembre", 10: "Octubre", 11: "Noviembre", 12: "Diciembre"
+}
+MONTHS_LOOKUP = {v.lower(): k for k, v in MONTHS_ES.items()}
+MONTHS_LOOKUP.update({
+    "ene": 1, "feb": 2, "mar": 3, "abr": 4, "may": 5, "jun": 6,
+    "jul": 7, "ago": 8, "sep": 9, "sept": 9, "oct": 10, "nov": 11, "dic": 12,
+    "jan": 1, "apr": 4, "aug": 8, "dec": 12,
+})
+
+
+def is_missing(v):
+    return v is None or v == "" or str(v).strip().lower() in {"none", "nan", "na", "n/a"}
+
+
+def normalize_month(v):
+    """Return canonical Spanish month label, e.g. Marzo 2026."""
+    if isinstance(v, (datetime, date)):
+        return f"{MONTHS_ES[v.month]} {v.year}"
+    if is_missing(v):
+        return ""
+    s = str(v).strip()
+    # Excel sometimes stores strings like 2026-03-01 00:00:00
+    for fmt in ["%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%d/%m/%Y", "%m/%d/%Y"]:
+        try:
+            d = datetime.strptime(s, fmt)
+            return f"{MONTHS_ES[d.month]} {d.year}"
+        except Exception:
+            pass
+    # mar-26 / Mar-26 / marzo 2026 / MARZO 2026
+    clean = s.replace(".", "").replace("_", " ").replace("-", " ")
+    parts = [p for p in clean.split() if p]
+    if len(parts) >= 2:
+        mon = parts[0].lower()
+        yr = parts[1]
+        m = MONTHS_LOOKUP.get(mon)
+        if m:
+            try:
+                y = int(yr)
+                if y < 100:
+                    y += 2000
+                return f"{MONTHS_ES[m]} {y}"
+            except Exception:
+                pass
+    # preserve user text with first letter capitalized when possible
+    return s
+
+
+def month_short(v):
+    nm = normalize_month(v)
+    return nm.split()[0].lower() if nm else "mes anterior"
+
+
+def fmt_int(n, missing=MISSING):
+    if is_missing(n):
+        return missing
+    try:
+        return f"{int(round(float(n))):,}".replace(",", ".")
+    except Exception:
+        return str(n)
+
+
+def fmt_money(n, missing=MISSING):
+    if is_missing(n):
+        return missing
+    return "$" + fmt_int(n, missing="")
+
+
+def fmt_pct(n, dec=1, comma=True, missing=MISSING):
+    if is_missing(n):
+        return missing
+    try:
+        s = f"{float(n):.{dec}f}%"
+        return s.replace(".", ",") if comma else s
+    except Exception:
+        return str(n)
+
+
+def fmt_m(n, dec=1, missing=MISSING):
+    if is_missing(n):
+        return missing
+    try:
+        return f"{float(n)/1_000_000:.{dec}f}M".replace(".", ",")
+    except Exception:
+        return str(n)
+
+
+def fmt_k(n, dec=1, missing=MISSING):
+    if is_missing(n):
+        return missing
+    try:
+        return f"{float(n)/1_000:.{dec}f}K".replace(".", ",")
+    except Exception:
+        return str(n)
+
+
+def diff_pct(new, old):
+    if is_missing(old) or old == 0 or is_missing(new):
+        return None
+    try:
+        return (float(new) - float(old)) / float(old) * 100
+    except Exception:
+        return None
+
+
+def var_label(new, old, prev_label, dec=1, approx=False):
+    d = diff_pct(new, old)
+    if d is None:
+        return MISSING
+    label = fmt_pct(d, dec=dec).replace("-", "−")
+    if approx:
+        return f"{label} aprox vs {prev_label}"
+    return f"{label} vs {prev_label}"
+
+
+def yes(v):
+    return str(v).strip().lower() in ["si", "sí", "yes", "true", "1", "x"]
+
+
+def as_rows(ws, header_row=4):
+    headers = [c.value for c in ws[header_row]]
+    rows = []
+    for r in ws.iter_rows(min_row=header_row+1, values_only=True):
+        if not any(v is not None for v in r):
+            continue
+        rows.append({headers[i]: r[i] if i < len(r) else None for i in range(len(headers)) if headers[i] is not None})
+    return rows
+
+
+def control_dict(wb):
+    ws = wb['00_Control']
+    d = {}
+    for row in ws.iter_rows(min_row=5, max_col=2, values_only=True):
+        if row[0]:
+            d[str(row[0])] = row[1]
+    return d
+
+
+def validation_value(wb, metric, prefer_expected=True):
+    ws = wb['09_Validaciones']
+    for row in ws.iter_rows(min_row=5, values_only=True):
+        if row[1] == metric:
+            return row[3] if prefer_expected and row[3] is not None else row[2]
+    return None
+
+
+def get_audience(wb, month, warnings):
+    out = {}
+    if '02_Audience' not in wb.sheetnames:
+        warnings.append("Falta hoja 02_Audience.")
+        return out
+    for r in as_rows(wb['02_Audience']):
+        p = r.get('Plataforma')
+        if not p:
+            continue
+        row_month = normalize_month(r.get('Mes'))
+        if row_month and row_month != month:
+            continue
+        out[str(p).strip()] = r
+    for p in PLATFORMS:
+        if p not in out:
+            warnings.append(f"Falta fila en 02_Audience para {p} / {month}.")
+    return out
+
+
+def get_paid(wb, month):
+    paid = {}
+    if '03_Paid_Media' not in wb.sheetnames:
+        return paid
+    for r in as_rows(wb['03_Paid_Media']):
+        row_month = normalize_month(r.get('Mes'))
+        if row_month and row_month != month:
+            continue
+        p = r.get('Plataforma')
+        if not p:
+            continue
+        paid.setdefault(str(p).strip(), 0)
+        if yes(r.get('Incluir Plataforma')):
+            paid[str(p).strip()] += r.get('Monto') or 0
+    return paid
+
+
+def platform_kpis_from_excel(wb, month, warnings):
+    platforms = {}
+    if '13_Platform_KPIs' in wb.sheetnames:
+        for r in as_rows(wb['13_Platform_KPIs']):
+            if not r.get('Plataforma'):
+                continue
+            row_month = normalize_month(r.get('Mes'))
+            if row_month and row_month != month:
+                continue
+            p = str(r['Plataforma']).strip()
+            platforms[p] = {
+                'views': r.get('Views'),
+                'views_prev': r.get('Views mes anterior'),
+                'reach': r.get('Alcance'),
+                'reach_prev': r.get('Alcance mes anterior'),
+                'interactions': r.get('Interacciones'),
+                'interactions_prev': r.get('Interacciones mes anterior'),
+                'er': r.get('ER %'),
+                'er_prev': r.get('ER % mes anterior'),
+                'contents': r.get('Contenidos'),
+                'contents_prev': r.get('Contenidos mes anterior'),
+                'stories': r.get('Stories'),
+                'reels': r.get('Reels'),
+                'carousels': r.get('Carruseles'),
+                'posts': r.get('Post'),
+                'budget': r.get('Presupuesto'),
+                'budget_prev': r.get('Presupuesto mes anterior'),
+                'top1_name': r.get('Top 1 nombre'),
+                'top1_value': r.get('Top 1 valor'),
+                'top2_name': r.get('Top 2 nombre'),
+                'top2_value': r.get('Top 2 valor'),
+                'top3_name': r.get('Top 3 nombre'),
+                'top3_value': r.get('Top 3 valor'),
+                'insight': r.get('Insight corto'),
+                'opportunity': r.get('Oportunidad / Nota'),
+            }
+        required = ['views', 'reach', 'interactions', 'er', 'contents']
+        for p in PLATFORMS:
+            if p not in platforms:
+                warnings.append(f"Falta fila en 13_Platform_KPIs para {p} / {month}.")
+            else:
+                for f in required:
+                    if is_missing(platforms[p].get(f)):
+                        warnings.append(f"Falta {f} en 13_Platform_KPIs para {p} / {month}.")
+        if platforms:
+            return platforms
+
+    # Fallback from 01_Content_Raw if the official sheet is absent or empty.
+    content = as_rows(wb['01_Content_Raw']) if '01_Content_Raw' in wb.sheetnames else []
+    fmt_map = {'STORY': 'stories', 'REEL': 'reels', 'VIDEO': 'reels', 'CARRUSEL': 'carousels', 'POST': 'posts'}
+    for r in content:
+        if normalize_month(r.get('Mes')) != month or not yes(r.get('Incluir Plataforma')):
+            continue
+        p = r.get('Plataforma')
+        if not p:
+            continue
+        rec = platforms.setdefault(str(p).strip(), {'views':0,'reach':0,'interactions':0,'contents':0,'stories':0,'reels':0,'carousels':0,'posts':0})
+        rec['views'] += r.get('Views') or 0
+        rec['reach'] += r.get('Alcance') or 0
+        rec['interactions'] += r.get('Interacciones totales') or 0
+        rec['contents'] += 1
+        f = str(r.get('Formato') or '').upper()
+        if f in fmt_map:
+            rec[fmt_map[f]] += 1
+    for p, rec in platforms.items():
+        rec['er'] = (rec['interactions'] / rec['reach'] * 100) if rec.get('reach') else None
+    return platforms
+
+
+def first_insight(wb, section, type_name=None, month=None):
+    if '07_Insights' not in wb.sheetnames:
+        return ''
+    for r in as_rows(wb['07_Insights']):
+        if month and normalize_month(r.get('Mes')) not in {month, ''}:
+            continue
+        if str(r.get('Sección')).strip().lower() == section.lower() and yes(r.get('Usar en PPT')):
+            if type_name is None or str(r.get('Tipo')).strip().lower() == type_name.lower():
+                parts = [r.get('Hallazgo'), r.get('Evidencia'), r.get('Recomendación')]
+                return ' '.join(str(x) for x in parts if x)
+    return ''
+
+
+def filter_month_rows(wb, sheet_name, month, include_col=None):
+    if sheet_name not in wb.sheetnames:
+        return []
+    rows = []
+    for r in as_rows(wb[sheet_name]):
+        row_month = normalize_month(r.get('Mes'))
+        if row_month and row_month != month:
+            continue
+        if include_col and not yes(r.get(include_col)):
+            continue
+        rows.append(r)
+    return rows
+
+
+def build_context(xlsx_path):
+    defaults = json.loads(DEFAULTS_PATH.read_text(encoding='utf-8'))
+    wb = load_workbook(xlsx_path, data_only=True)
+    warnings = []
+    ctrl = control_dict(wb)
+    month = normalize_month(ctrl.get('Mes actual') or 'Marzo 2026')
+    prev_month = normalize_month(ctrl.get('Mes anterior') or 'Febrero 2026')
+    prev_label = month_short(prev_month)
+    month_upper = month.split()[0].upper() if month else MISSING
+    prev = defaults['previous_month']
+
+    overview = {
+        'views': validation_value(wb, 'Views') or prev.get('views'),
+        'reach': validation_value(wb, 'Alcance'),
+        'interactions': validation_value(wb, 'Interacciones'),
+        'contents': validation_value(wb, 'Contenidos'),
+        'investment': sum((r.get('Monto') or 0) for r in filter_month_rows(wb, '03_Paid_Media', month) if yes(r.get('Incluir Overview'))),
+        'er': None,
+    }
+    overview['er'] = (float(overview['interactions']) / float(overview['reach']) * 100) if overview.get('reach') else None
+    for metric, val in [('Views', overview['views']), ('Alcance', overview['reach']), ('Interacciones', overview['interactions']), ('Contenidos', overview['contents'])]:
+        if is_missing(val):
+            warnings.append(f"Falta valor de overview para {metric} en 09_Validaciones.")
+
+    audience = get_audience(wb, month, warnings)
+    platform_kpis = platform_kpis_from_excel(wb, month, warnings)
+    paid = get_paid(wb, month)
+
+    # Merge audience and paid into platform records.
+    for p, a in audience.items():
+        platform_kpis.setdefault(p, {})
+        platform_kpis[p].update({
+            'followers': a.get('Seguidores'),
+            'followers_prev': a.get('Seguidores mes anterior'),
+            'followers_growth': a.get('Crecimiento'),
+            'women_pct': a.get('Mujeres %'),
+            'men_pct': a.get('Hombres %'),
+            'age_18_24': a.get('18-24 %'),
+            'age_25_34': a.get('25-34 %'),
+            'age_35_44': a.get('35-44 %'),
+            'age_45_54': a.get('45-54 %'),
+            'age_55': a.get('55+ %'),
+        })
+    for p in PLATFORMS:
+        rec = platform_kpis.get(p, {})
+        if is_missing(rec.get('followers')):
+            warnings.append(f"Falta Seguidores en 02_Audience para {p} / {month}.")
+    for p, amount in paid.items():
+        platform_kpis.setdefault(p, {})
+        if is_missing(platform_kpis[p].get('budget')):
+            platform_kpis[p]['budget'] = amount
+
+    squad_rows = filter_month_rows(wb, '04_Squad', month, include_col='Incluir PPT')
+    squad_tot = {
+        'views': sum(r.get('Views') or 0 for r in squad_rows),
+        'reach': sum(r.get('Alcance') or 0 for r in squad_rows),
+        'interactions': sum(r.get('Interacciones') or 0 for r in squad_rows),
+        'budget': sum(r.get('Monto') or 0 for r in squad_rows),
+    }
+    squad_tot['er'] = (squad_tot['interactions'] / squad_tot['reach'] * 100) if squad_tot['reach'] else None
+    squad = {r['Talento']: r for r in squad_rows if r.get('Talento')}
+
+    mmpp_rows = filter_month_rows(wb, '05_MMPP', month, include_col='Usar en PPT')
+    mmpp = mmpp_rows[0] if mmpp_rows else {}
+    if not mmpp:
+        warnings.append(f"Falta fila activa en 05_MMPP para {month}.")
+
+    ctx = {
+        'CLIENTE': ctrl.get('Cliente') or 'Maicao',
+        'MES': month or MISSING,
+        'MES_UPPER': month_upper,
+        'MES_PREV': prev_month or MISSING,
+        'MES_PREV_LABEL': prev_label,
+        'TITLE_META': f"{ctrl.get('Cliente') or 'Maicao'} · {month}",
+        'OVERVIEW_VIEWS': fmt_int(overview['views']),
+        'OVERVIEW_VIEWS_M': fmt_m(overview['views']),
+        'OVERVIEW_REACH': fmt_int(overview['reach']),
+        'OVERVIEW_REACH_M': fmt_m(overview['reach']),
+        'OVERVIEW_INTERACTIONS': fmt_int(overview['interactions']),
+        'OVERVIEW_INTERACTIONS_K': fmt_k(overview['interactions']),
+        'OVERVIEW_ER': fmt_pct(overview['er']),
+        'OVERVIEW_INVESTMENT': fmt_money(overview['investment']),
+        'OVERVIEW_CONTENTS': fmt_int(overview['contents']),
+        'OVERVIEW_VIEWS_VAR': var_label(overview['views'], prev.get('views'), prev_label),
+        'OVERVIEW_REACH_VAR': var_label(overview['reach'], prev.get('reach'), prev_label),
+        'OVERVIEW_INTERACTIONS_VAR': var_label(overview['interactions'], prev.get('interactions'), prev_label),
+        'OVERVIEW_ER_VAR': var_label(overview['er'], prev.get('er'), prev_label),
+        'OVERVIEW_INVESTMENT_VAR': var_label(overview['investment'], prev.get('investment'), prev_label),
+        'PREV_VIEWS_M': fmt_m(prev['views']),
+        'PREV_INTERACTIONS_K': fmt_k(prev['interactions']),
+        'PREV_ER_DOT': fmt_pct(prev['er'], comma=False),
+        'CURR_ER_DOT': fmt_pct(overview['er'], comma=False),
+        'PREV_INVESTMENT': fmt_int(prev['investment']),
+        'CURR_INVESTMENT': fmt_int(overview['investment']),
+        'PREV_CONTENTS': fmt_int(prev['contents']),
+    }
+
+    for name, prefix in [('Instagram', 'IG'), ('Facebook', 'FB'), ('TikTok', 'TT')]:
+        p = platform_kpis.get(name, {})
+        followers_growth = p.get('followers_growth')
+        if is_missing(followers_growth) and not is_missing(p.get('followers')) and not is_missing(p.get('followers_prev')):
+            try:
+                followers_growth = (p.get('followers') or 0) - (p.get('followers_prev') or 0)
+            except Exception:
+                followers_growth = None
+        if not is_missing(followers_growth):
+            fg = float(followers_growth)
+            growth_label = f"+{fmt_int(fg, missing='')} vs mes anterior" if fg >= 0 else f"{fmt_int(fg, missing='')} vs mes anterior"
+        else:
+            growth_label = MISSING
+        ctx.update({
+            f'{prefix}_VIEWS': fmt_int(p.get('views')),
+            f'{prefix}_VIEWS_M': fmt_m(p.get('views')),
+            f'{prefix}_REACH': fmt_int(p.get('reach')),
+            f'{prefix}_REACH_M': fmt_m(p.get('reach')),
+            f'{prefix}_INTERACTIONS': fmt_int(p.get('interactions')),
+            f'{prefix}_ER': fmt_pct(p.get('er')),
+            f'{prefix}_FOLLOWERS': fmt_int(p.get('followers')),
+            f'{prefix}_FOLLOWERS_GROWTH': growth_label,
+            f'{prefix}_CONTENTS': fmt_int(p.get('contents')),
+            f'{prefix}_BUDGET': fmt_money(p.get('budget')),
+            f'{prefix}_VIEWS_VAR': var_label(p.get('views'), p.get('views_prev'), prev_label, approx=(prefix=='FB')),
+            f'{prefix}_REACH_VAR': var_label(p.get('reach'), p.get('reach_prev'), prev_label, approx=(prefix=='FB')),
+            f'{prefix}_INTERACTIONS_VAR': var_label(p.get('interactions'), p.get('interactions_prev'), prev_label),
+            f'{prefix}_ER_PREV': fmt_pct(p.get('er_prev')),
+            f'{prefix}_BUDGET_PREV': fmt_money(p.get('budget_prev')),
+            f'{prefix}_CONTENTS_VAR': (f"+{fmt_int((p.get('contents') or 0) - (p.get('contents_prev') or 0), missing='')} vs {prev_label}" if not is_missing(p.get('contents_prev')) and (p.get('contents') or 0) >= (p.get('contents_prev') or 0) else f"{fmt_int((p.get('contents') or 0) - (p.get('contents_prev') or 0), missing='')} vs {prev_label}" if not is_missing(p.get('contents_prev')) else MISSING),
+            f'{prefix}_STORIES': fmt_int(p.get('stories')),
+            f'{prefix}_REELS': fmt_int(p.get('reels')),
+            f'{prefix}_CAROUSELS': fmt_int(p.get('carousels')),
+            f'{prefix}_POSTS': fmt_int(p.get('posts')),
+            f'{prefix}_AGE_18_24': fmt_pct(p.get('age_18_24'), 0),
+            f'{prefix}_AGE_25_34': fmt_pct(p.get('age_25_34'), 0),
+            f'{prefix}_AGE_35_44': fmt_pct(p.get('age_35_44'), 0),
+            f'{prefix}_AGE_45_54': fmt_pct(p.get('age_45_54'), 0),
+            f'{prefix}_AGE_55': fmt_pct(p.get('age_55'), 0),
+            f'{prefix}_TOP1_NAME': p.get('top1_name') or MISSING,
+            f'{prefix}_TOP1_VALUE': p.get('top1_value') or MISSING,
+            f'{prefix}_TOP2_NAME': p.get('top2_name') or MISSING,
+            f'{prefix}_TOP2_VALUE': p.get('top2_value') or MISSING,
+            f'{prefix}_TOP3_NAME': p.get('top3_name') or MISSING,
+            f'{prefix}_TOP3_VALUE': p.get('top3_value') or MISSING,
+            f'{prefix}_INSIGHT': p.get('insight') or MISSING,
+            f'{prefix}_OPPORTUNITY': p.get('opportunity') or MISSING,
+        })
+
+    ctx.update({
+        'SQUAD_VIEWS': fmt_int(squad_tot['views'] if squad_rows else None),
+        'SQUAD_VIEWS_M': fmt_m(squad_tot['views'] if squad_rows else None),
+        'SQUAD_REACH': fmt_int(squad_tot['reach'] if squad_rows else None),
+        'SQUAD_REACH_M': fmt_m(squad_tot['reach'] if squad_rows else None),
+        'SQUAD_INTERACTIONS': fmt_int(squad_tot['interactions'] if squad_rows else None),
+        'SQUAD_ER': fmt_pct(squad_tot['er']),
+        'SQUAD_BUDGET': fmt_money(squad_tot['budget'] if squad_rows else None),
+    })
+    talent_map = {'Skarleth Labra': 'SKAR', 'Busquilla': 'BUSQUI', 'Camila Andrade': 'CAMI', 'Disley Ramos': 'DISLEY'}
+    for t, prefix in talent_map.items():
+        r = squad.get(t, {})
+        val = r.get('Views')
+        ctx[f'{prefix}_VIEWS_M'] = fmt_m(val) if val and val >= 1_000_000 else fmt_k(val, 0)
+        ctx[f'{prefix}_ER'] = fmt_pct(r.get('ER %'))
+
+    ctx.update({
+        'MMPP_VIEWS': fmt_int(mmpp.get('Views')),
+        'MMPP_REACH': fmt_int(mmpp.get('Alcance')),
+        'MMPP_INTERACTIONS': fmt_int(mmpp.get('Interacciones')),
+        'MMPP_ER': fmt_pct(mmpp.get('ER %')),
+        'MMPP_CONTENTS': fmt_int(mmpp.get('Contenidos')),
+        'MMPP_COMMENT': mmpp.get('Comentario general') or MISSING,
+    })
+    ctx['_WARNINGS'] = warnings
+    return ctx
+
+
+GLOBAL_TEXT_TO_TOKEN = {
+    'Maicao · Marzo 2026': 'TITLE_META',
+    'MARZO 2026': 'MES_UPPER',
+}
+
+SLIDE_TEXT_TO_TOKEN = {
+    1: {'16.5M': 'OVERVIEW_VIEWS_M','8.2M': 'OVERVIEW_REACH_M','110.7K': 'OVERVIEW_INTERACTIONS_K'},
+    2: {
+        '16.486.179': 'OVERVIEW_VIEWS','+24,5% vs febrero': 'OVERVIEW_VIEWS_VAR','8.211.420': 'OVERVIEW_REACH',
+        '+0,2% vs febrero': 'OVERVIEW_REACH_VAR','1,3%': 'OVERVIEW_ER','-55,2% vs febrero': 'OVERVIEW_ER_VAR',
+        '110.695': 'OVERVIEW_INTERACTIONS','-56,3% vs febrero': 'OVERVIEW_INTERACTIONS_VAR','$3.800.400': 'OVERVIEW_INVESTMENT',
+        '+78,4% vs febrero': 'OVERVIEW_INVESTMENT_VAR','Febrero vs Marzo': 'MES_PREV','13,2M': 'PREV_VIEWS_M',
+        '16,5M': 'OVERVIEW_VIEWS_M','235,7K': 'PREV_INTERACTIONS_K','110,7K': 'OVERVIEW_INTERACTIONS_K'},
+    3: {'2.9%': 'PREV_ER_DOT','1.3%': 'CURR_ER_DOT','2.130.000': 'PREV_INVESTMENT','3.800.400': 'CURR_INVESTMENT','140': 'PREV_CONTENTS','156': 'OVERVIEW_CONTENTS'},
+    4: {
+        '8,2M': 'IG_VIEWS_M','3,2M': 'FB_VIEWS_M','4,5M': 'TT_VIEWS_M','4,0M': 'IG_REACH_M','1,9M': ['FB_REACH_M', 'TT_REACH_M'],
+        '1,4%': 'IG_ER','0,2%': 'FB_ER','0,9%': 'TT_ER','332.382 seguidores · 58.723 interacciones': 'IG_FOLLOWERS_INTERACTIONS',
+        '565.501 seguidores · 4.656 interacciones': 'FB_FOLLOWERS_INTERACTIONS','30.120 seguidores · 17.148 interacciones': 'TT_FOLLOWERS_INTERACTIONS'},
+    5: {
+        '332.382': 'IG_FOLLOWERS','+1.389 vs mes anterior': 'IG_FOLLOWERS_GROWTH','92': 'IG_CONTENTS','+10 vs febrero': 'IG_CONTENTS_VAR','1,4%': 'IG_ER','antes 3,2%': 'IG_ER_PREV_LINE','$1.670.000': 'IG_BUDGET','antes $850.000': 'IG_BUDGET_PREV_LINE','68': 'IG_STORIES','13': 'IG_REELS','10': 'IG_CAROUSELS','Bubble Maybelline': 'IG_TOP1_NAME','1,51M': 'IG_TOP1_VALUE','Check Bienvenida': 'IG_TOP2_NAME','763K': 'IG_TOP2_VALUE','Make up SAMY': 'IG_TOP3_NAME','1,69M': 'IG_TOP3_VALUE'},
+    6: {
+        '565.501': 'FB_FOLLOWERS','+430 vs mes anterior': 'FB_FOLLOWERS_GROWTH','3.223.306': 'FB_VIEWS','+69% aprox vs febrero': 'FB_VIEWS_VAR','1.905.477': 'FB_REACH','+63% aprox vs febrero': 'FB_REACH_VAR','0,2%': 'FB_ER','antes 0,3%': 'FB_ER_PREV_LINE','Prod. $1.000': 'FB_TOP1_NAME','526K': 'FB_TOP1_VALUE','Máscara Bubble': 'FB_TOP2_NAME','508K': 'FB_TOP2_VALUE','SAMY': 'FB_TOP3_NAME','531K': 'FB_TOP3_VALUE','19': 'FB_STORIES','9': 'FB_REELS','2': 'FB_CAROUSELS','1': 'FB_POSTS'},
+    7: {
+        '30.120': 'TT_FOLLOWERS','+2.768 vs mes anterior': 'TT_FOLLOWERS_GROWTH','4.522.490': 'TT_VIEWS','+15,7% vs febrero': 'TT_VIEWS_VAR','17.148': 'TT_INTERACTIONS','+7,8% vs febrero': 'TT_INTERACTIONS_VAR','0,9%': 'TT_ER','antes 0,7%': 'TT_ER_PREV_LINE','36%': 'TT_AGE_18_24','32%': 'TT_AGE_25_34','13%': 'TT_AGE_35_44','8%': 'TT_AGE_45_54','10%': 'TT_AGE_55','Maquillaje principiantes': 'TT_TOP1_NAME','2.880': 'TT_TOP1_VALUE','EGC Garnier': 'TT_TOP2_NAME','630': 'TT_TOP2_VALUE','UGC hábitos piel': 'TT_TOP3_NAME','1.387': 'TT_TOP3_VALUE'},
+    9: {
+        '4.637.075': 'SQUAD_VIEWS','2.020.826': 'SQUAD_REACH','60.146': 'SQUAD_INTERACTIONS','3,0%': 'SQUAD_ER','2,05M': 'SKAR_VIEWS_M','88K': 'BUSQUI_VIEWS_M','811K': 'CAMI_VIEWS_M','1,69M': 'DISLEY_VIEWS_M','4,5%': 'SKAR_ER','1,1%': 'BUSQUI_ER','0,8%': 'CAMI_ER','2,2%': 'DISLEY_ER'},
+    10: {'3.336.786': 'MMPP_VIEWS','1.443.025': 'MMPP_REACH','13.463': 'MMPP_INTERACTIONS','1,0%': 'MMPP_ER','Mix de 14 contenidos': 'MMPP_CONTENTS_LINE'},
+}
+
+
+def enrich_context(ctx):
+    ctx['IG_FOLLOWERS_INTERACTIONS'] = f"{ctx.get('IG_FOLLOWERS',MISSING)} seguidores · {ctx.get('IG_INTERACTIONS',MISSING)} interacciones"
+    ctx['FB_FOLLOWERS_INTERACTIONS'] = f"{ctx.get('FB_FOLLOWERS',MISSING)} seguidores · {ctx.get('FB_INTERACTIONS',MISSING)} interacciones"
+    ctx['TT_FOLLOWERS_INTERACTIONS'] = f"{ctx.get('TT_FOLLOWERS',MISSING)} seguidores · {ctx.get('TT_INTERACTIONS',MISSING)} interacciones"
+    for prefix in ['IG', 'FB', 'TT']:
+        ctx[f'{prefix}_ER_PREV_LINE'] = f"antes {ctx.get(f'{prefix}_ER_PREV')}" if ctx.get(f'{prefix}_ER_PREV') not in [None, '', MISSING] else MISSING
+        ctx[f'{prefix}_BUDGET_PREV_LINE'] = f"antes {ctx.get(f'{prefix}_BUDGET_PREV')}" if ctx.get(f'{prefix}_BUDGET_PREV') not in [None, '', MISSING] else MISSING
+    return ctx
+
+
+def resolve_token(token, replacements, original):
+    if token == 'MMPP_CONTENTS_LINE':
+        val = replacements.get('MMPP_CONTENTS')
+        return f"Mix de {val if val not in [None, '', MISSING] else MISSING} contenidos"
+    val = replacements.get(token, original)
+    if val is None or val == "":
+        return MISSING
+    return str(val)
+
+
+def replace_text_in_shape(shape, replacements, text_map, state):
+    if not hasattr(shape, 'text_frame') or shape.text_frame is None:
+        return 0
+    count = 0
+    for paragraph in shape.text_frame.paragraphs:
+        runs = list(paragraph.runs)
+        if not runs:
+            continue
+        full = ''.join(run.text for run in runs)
+        new_full = full
+        for old, token_spec in sorted(text_map.items(), key=lambda x: len(x[0]), reverse=True):
+            if old not in new_full:
+                continue
+            if isinstance(token_spec, list):
+                idx = state.get(old, 0)
+                token = token_spec[min(idx, len(token_spec)-1)]
+                state[old] = idx + 1
+            else:
+                token = token_spec
+            val = resolve_token(token, replacements, old)
+            new_full = new_full.replace(old, val, 1)
+        if new_full != full:
+            runs[0].text = new_full
+            for run in runs[1:]:
+                run.text = ''
+            count += 1
+    return count
+
+
+def tune_kpi_cards(prs):
+    """Small layout correction for KPI cards in slides 5-7.
+    Moves growth labels slightly down and reduces their font size so they do not overlap with large numbers.
+    """
+    for slide_idx in [5, 6, 7]:
+        if slide_idx > len(prs.slides):
+            continue
+        slide = prs.slides[slide_idx-1]
+        for shape in slide.shapes:
+            if not hasattr(shape, 'text_frame') or shape.text_frame is None:
+                continue
+            txt = shape.text.strip()
+            if 'vs mes anterior' in txt or txt.startswith('antes '):
+                # Move down a touch inside the KPI tile; reduce text size.
+                shape.top = shape.top + Inches(0.08)
+                for p in shape.text_frame.paragraphs:
+                    for run in p.runs:
+                        run.font.size = Pt(8.5)
+            # Shrink very large follower/money numbers in KPI cards slightly.
+            if re.fullmatch(r'(\$)?[0-9\.]+', txt):
+                for p in shape.text_frame.paragraphs:
+                    for run in p.runs:
+                        if run.font.size and run.font.size.pt > 28:
+                            run.font.size = Pt(25)
+
+
+def update_ppt(template_path, output_path, context):
+    context = enrich_context(context)
+    prs = Presentation(template_path)
+    changes = 0
+    for idx, slide in enumerate(prs.slides, start=1):
+        text_map = dict(GLOBAL_TEXT_TO_TOKEN)
+        text_map.update(SLIDE_TEXT_TO_TOKEN.get(idx, {}))
+        state = {}
+        for shape in slide.shapes:
+            changes += replace_text_in_shape(shape, context, text_map, state)
+            if shape.has_table:
+                for row in shape.table.rows:
+                    for cell in row.cells:
+                        changes += replace_text_in_shape(cell, context, text_map, state)
+    tune_kpi_cards(prs)
+    prs.save(output_path)
+    return changes
+
+
+def write_validation_report(path, ctx):
+    warnings = ctx.get('_WARNINGS', [])
+    lines = []
+    lines.append("VALIDACION MAICAO AUTOMATION v04")
+    lines.append(f"Mes: {ctx.get('MES')}")
+    lines.append("")
+    if warnings:
+        lines.append("Estado: REVISAR")
+        lines.append("")
+        lines.append("Alertas:")
+        for w in warnings:
+            lines.append(f"- {w}")
+    else:
+        lines.append("Estado: OK")
+        lines.append("No se detectaron campos obligatorios faltantes.")
+    path.write_text("\n".join(lines), encoding='utf-8')
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--input', default=str(ROOT / 'Maicao_Reporte_Automation_Model_v04.xlsx'))
+    ap.add_argument('--template', default=str(ROOT / 'template' / 'Maicao_Template_Visual_v02.pptx'))
+    ap.add_argument('--output', default=str(ROOT / 'output' / 'Maicao_Reporte_Auto_Template_v04.pptx'))
+    ap.add_argument('--strict', action='store_true', help='Detener generacion si hay datos obligatorios faltantes.')
+    args = ap.parse_args()
+    ctx = build_context(args.input)
+    Path(args.output).parent.mkdir(parents=True, exist_ok=True)
+    report_path = Path(args.output).parent / 'validation_report_v04.txt'
+    write_validation_report(report_path, ctx)
+
+    warnings = ctx.get('_WARNINGS', [])
+    if warnings:
+        print("VALIDACION: REVISAR")
+        for w in warnings:
+            print(f"- {w}")
+        print(f"Reporte de validacion: {report_path}")
+        if args.strict:
+            print("Generacion detenida por --strict.")
+            sys.exit(2)
+    else:
+        print("VALIDACION: OK")
+
+    changes = update_ppt(args.template, args.output, ctx)
+    print(f"OK: {args.output}")
+    print(f"Text replacements applied: {changes}")
+    print("Fuente KPI plataforma: Excel hoja 13_Platform_KPIs")
+    print(f"Reporte de validacion: {report_path}")
+
+
+if __name__ == '__main__':
+    main()
