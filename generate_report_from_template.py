@@ -1,19 +1,20 @@
 #!/usr/bin/env python3
 """
-Generador Maicao Visual v04
+Generador Maicao Visual v07
 
-Mejoras v04:
+Mejoras v07:
 - Validacion automatica antes de generar: avisa datos faltantes por hoja/plataforma/mes.
 - Fallback visual: si falta un dato, la PPT muestra "Dato pendiente".
 - Ajuste de tarjetas KPI para evitar que "vs mes anterior" se monte sobre el numero.
 - Normalizacion de mes: acepta texto tipo "Marzo 2026" o fechas Excel tipo "mar-26".
 - KPIs por plataforma desde Excel: hoja 13_Platform_KPIs.
+- Barras dinamicas como shapes: recalcula altos/posiciones desde la data.
 
 Uso Terminal:
   python3 generate_report_from_template.py
 
 Salida default:
-  output/Maicao_Reporte_Auto_Template_v04.pptx
+  output/Maicao_Reporte_Auto_Template_v07.pptx
 """
 import argparse, json, re, sys
 from pathlib import Path
@@ -121,6 +122,45 @@ def fmt_k(n, dec=1, missing=MISSING):
         return f"{float(n)/1_000:.{dec}f}K".replace(".", ",")
     except Exception:
         return str(n)
+
+
+def to_float(v, default=None):
+    """Parse numeric values from Excel or formatted strings like 1,7M / 88K / 1,4% / $850.000."""
+    if is_missing(v):
+        return default
+    if isinstance(v, (int, float)):
+        return float(v)
+    s = str(v).strip()
+    if not s:
+        return default
+    mult = 1.0
+    su = s.upper()
+    if "M" in su:
+        mult = 1_000_000.0
+    elif "K" in su:
+        mult = 1_000.0
+    # Keep digits, comma, dot and minus. Determine decimal separator.
+    clean = re.sub(r"[^0-9,\.\-]", "", s)
+    if not clean:
+        return default
+    if "," in clean and "." in clean:
+        # Assume dots are thousands and comma is decimal: 1.234,5
+        clean = clean.replace(".", "").replace(",", ".")
+    elif "," in clean:
+        clean = clean.replace(",", ".")
+    elif "." in clean:
+        # If there are multiple dots, treat them as thousands separators.
+        if clean.count(".") > 1:
+            clean = clean.replace(".", "")
+        # If a single dot and three digits after it, likely thousands, e.g. 13.463
+        else:
+            left, right = clean.split(".")
+            if len(right) == 3 and len(left) >= 1:
+                clean = left + right
+    try:
+        return float(clean) * mult
+    except Exception:
+        return default
 
 
 def diff_pct(new, old):
@@ -475,6 +515,29 @@ def build_context(xlsx_path):
         'MMPP_CONTENTS': fmt_int(mmpp.get('Contenidos')),
         'MMPP_COMMENT': mmpp.get('Comentario general') or MISSING,
     })
+    # Numeric values used by v07 to resize bars/shapes dynamically.
+    def pv(platform, field):
+        return to_float(platform_kpis.get(platform, {}).get(field), 0)
+
+    ctx['_CHART_VALUES'] = {
+        # Slide 4: channel portfolio.
+        'slide4_views': [pv('Instagram', 'views'), pv('Facebook', 'views'), pv('TikTok', 'views')],
+        'slide4_reach': [pv('Instagram', 'reach'), pv('Facebook', 'reach'), pv('TikTok', 'reach')],
+        'slide4_er': [pv('Instagram', 'er'), pv('Facebook', 'er'), pv('TikTok', 'er')],
+        # Slide 5: Instagram.
+        'slide5_mix': [pv('Instagram', 'stories'), pv('Instagram', 'reels'), pv('Instagram', 'carousels')],
+        'slide5_top': [to_float(platform_kpis.get('Instagram', {}).get('top1_value'), 0), to_float(platform_kpis.get('Instagram', {}).get('top2_value'), 0), to_float(platform_kpis.get('Instagram', {}).get('top3_value'), 0)],
+        # Slide 6: Facebook.
+        'slide6_top': [to_float(platform_kpis.get('Facebook', {}).get('top1_value'), 0), to_float(platform_kpis.get('Facebook', {}).get('top2_value'), 0), to_float(platform_kpis.get('Facebook', {}).get('top3_value'), 0)],
+        'slide6_formats': [pv('Facebook', 'stories'), pv('Facebook', 'reels'), pv('Facebook', 'carousels'), pv('Facebook', 'posts')],
+        # Slide 7: TikTok.
+        'slide7_age': [pv('TikTok', 'age_18_24'), pv('TikTok', 'age_25_34'), pv('TikTok', 'age_35_44'), pv('TikTok', 'age_45_54'), pv('TikTok', 'age_55')],
+        'slide7_top': [to_float(platform_kpis.get('TikTok', {}).get('top1_value'), 0), to_float(platform_kpis.get('TikTok', {}).get('top2_value'), 0), to_float(platform_kpis.get('TikTok', {}).get('top3_value'), 0)],
+        # Slide 9: Squad.
+        'slide9_views': [to_float(squad.get('Skarleth Labra', {}).get('Views'), 0), to_float(squad.get('Busquilla', {}).get('Views'), 0), to_float(squad.get('Camila Andrade', {}).get('Views'), 0), to_float(squad.get('Disley Ramos', {}).get('Views'), 0)],
+        'slide9_er': [to_float(squad.get('Skarleth Labra', {}).get('ER %'), 0), to_float(squad.get('Busquilla', {}).get('ER %'), 0), to_float(squad.get('Camila Andrade', {}).get('ER %'), 0), to_float(squad.get('Disley Ramos', {}).get('ER %'), 0)],
+    }
+
     ctx['_WARNINGS'] = warnings
     return ctx
 
@@ -584,6 +647,208 @@ def tune_kpi_cards(prs):
                             run.font.size = Pt(25)
 
 
+
+
+# -----------------------------------------------------------------------------
+# Dynamic chart bars v07
+# -----------------------------------------------------------------------------
+# v07 stops relying on the internal PowerPoint shape order at runtime.
+# It tags bars/labels with stable technical names and then updates shapes by name.
+# If a template is still untagged, it will tag the known v02/v06 template once using
+# the fallback indices below. After that, charts are robust to minor position edits.
+
+BAR_SPECS = [
+    # key, slide number, bar names, label names, fallback bar indices, fallback label indices
+    ('slide4_views', 4,
+     ['bar_channel_views_ig','bar_channel_views_fb','bar_channel_views_tt'],
+     ['label_channel_views_ig','label_channel_views_fb','label_channel_views_tt'],
+     [6,9,12], [8,11,14]),
+    ('slide4_reach', 4,
+     ['bar_channel_reach_ig','bar_channel_reach_fb','bar_channel_reach_tt'],
+     ['label_channel_reach_ig','label_channel_reach_fb','label_channel_reach_tt'],
+     [16,19,22], [18,21,24]),
+    ('slide4_er', 4,
+     ['bar_channel_er_ig','bar_channel_er_fb','bar_channel_er_tt'],
+     ['label_channel_er_ig','label_channel_er_fb','label_channel_er_tt'],
+     [26,29,32], [28,31,34]),
+
+    ('slide5_mix', 5,
+     ['bar_ig_mix_stories','bar_ig_mix_reels','bar_ig_mix_carousels'],
+     ['label_ig_mix_stories','label_ig_mix_reels','label_ig_mix_carousels'],
+     [22,25,28], [24,27,30]),
+    ('slide5_top', 5,
+     ['bar_ig_top_1','bar_ig_top_2','bar_ig_top_3'],
+     ['label_ig_top_1','label_ig_top_2','label_ig_top_3'],
+     [32,35,38], [34,37,40]),
+
+    ('slide6_top', 6,
+     ['bar_fb_top_1','bar_fb_top_2','bar_fb_top_3'],
+     ['label_fb_top_1','label_fb_top_2','label_fb_top_3'],
+     [22,25,28], [24,27,30]),
+    ('slide6_formats', 6,
+     ['bar_fb_format_stories','bar_fb_format_reels','bar_fb_format_carousels','bar_fb_format_post'],
+     ['label_fb_format_stories','label_fb_format_reels','label_fb_format_carousels','label_fb_format_post'],
+     [32,35,38,41], [34,37,40,43]),
+
+    ('slide7_age', 7,
+     ['bar_tt_age_18_24','bar_tt_age_25_34','bar_tt_age_35_44','bar_tt_age_45_54','bar_tt_age_55'],
+     ['label_tt_age_18_24','label_tt_age_25_34','label_tt_age_35_44','label_tt_age_45_54','label_tt_age_55'],
+     [22,25,28,31,34], [24,27,30,33,36]),
+    ('slide7_top', 7,
+     ['bar_tt_top_1','bar_tt_top_2','bar_tt_top_3'],
+     ['label_tt_top_1','label_tt_top_2','label_tt_top_3'],
+     [38,41,44], [40,43,46]),
+
+    ('slide9_views', 9,
+     ['bar_squad_views_skar','bar_squad_views_busquilla','bar_squad_views_cami','bar_squad_views_disley'],
+     ['label_squad_views_skar','label_squad_views_busquilla','label_squad_views_cami','label_squad_views_disley'],
+     [22,25,28,31], [24,27,30,33]),
+    ('slide9_er', 9,
+     ['bar_squad_er_skar','bar_squad_er_busquilla','bar_squad_er_cami','bar_squad_er_disley'],
+     ['label_squad_er_skar','label_squad_er_busquilla','label_squad_er_cami','label_squad_er_disley'],
+     [35,38,41,44], [37,40,43,46]),
+]
+
+
+def _shape_bottom(shape):
+    return int(shape.top + shape.height)
+
+
+def _safe_shape(slide, idx):
+    try:
+        return slide.shapes[idx]
+    except Exception:
+        return None
+
+
+def _find_shape_by_name(slide, name):
+    for shape in slide.shapes:
+        if getattr(shape, 'name', None) == name:
+            return shape
+    return None
+
+
+def tag_chart_shapes(prs):
+    """Tag chart bars and labels with stable names when the template is untagged.
+
+    This is intentionally conservative: it only uses fallback indices for the approved
+    v02/v06 template structure. If a template has already been tagged, it leaves it alone.
+    Returns a diagnostics list.
+    """
+    diagnostics = []
+    tagged = 0
+    missing = 0
+    for key, slide_no, bar_names, label_names, bar_indices, label_indices in BAR_SPECS:
+        if slide_no > len(prs.slides):
+            diagnostics.append(f"{key}: slide {slide_no} no existe")
+            missing += len(bar_names)
+            continue
+        slide = prs.slides[slide_no-1]
+        # If all bars already named, do nothing.
+        existing = sum(1 for n in bar_names if _find_shape_by_name(slide, n) is not None)
+        if existing == len(bar_names):
+            diagnostics.append(f"{key}: barras nombradas OK ({existing}/{len(bar_names)})")
+            continue
+        # Otherwise tag by fallback indices.
+        for idx, name in zip(bar_indices, bar_names):
+            sh = _safe_shape(slide, idx)
+            if sh is not None:
+                sh.name = name
+                tagged += 1
+            else:
+                diagnostics.append(f"{key}: no encontre barra fallback index {idx} para {name}")
+                missing += 1
+        for idx, name in zip(label_indices, label_names):
+            sh = _safe_shape(slide, idx)
+            if sh is not None:
+                sh.name = name
+                tagged += 1
+            else:
+                diagnostics.append(f"{key}: no encontre label fallback index {idx} para {name}")
+        diagnostics.append(f"{key}: tagged by fallback indices")
+    diagnostics.append(f"Template tagging: {tagged} shapes tagged, {missing} missing")
+    return diagnostics
+
+
+def _collect_named_shapes(slide, names, fallback_indices=None):
+    shapes = []
+    missing = []
+    for pos, name in enumerate(names):
+        sh = _find_shape_by_name(slide, name)
+        if sh is None and fallback_indices and pos < len(fallback_indices):
+            # Emergency fallback for legacy templates.
+            sh = _safe_shape(slide, fallback_indices[pos])
+            if sh is not None:
+                sh.name = name
+        if sh is None:
+            missing.append(name)
+        shapes.append(sh)
+    return shapes, missing
+
+
+def _scale_named_bar_group(slide, values, bar_names, label_names=None, fallback_bar_indices=None, fallback_label_indices=None, min_height=12000):
+    vals = [to_float(v, 0) or 0 for v in (values or [])]
+    bars, missing_bars = _collect_named_shapes(slide, bar_names, fallback_bar_indices)
+    labels, missing_labels = _collect_named_shapes(slide, label_names or [], fallback_label_indices)
+    valid_bars = [b for b in bars if b is not None]
+    if not valid_bars:
+        return 0, missing_bars, missing_labels
+    max_val = max(vals) if vals else 0
+    if max_val <= 0:
+        return 0, missing_bars, missing_labels
+    # Use the largest existing bar as the chart maximum, preserving user design.
+    max_height = max(int(b.height) for b in valid_bars)
+    bottom = max(_shape_bottom(b) for b in valid_bars)
+    changes = 0
+    for pos, b in enumerate(bars):
+        if b is None:
+            continue
+        value = vals[pos] if pos < len(vals) else 0
+        new_h = min_height if value <= 0 else max(min_height, int(max_height * value / max_val))
+        b.height = new_h
+        b.top = bottom - new_h
+        changes += 1
+        if labels and pos < len(labels) and labels[pos] is not None:
+            lab = labels[pos]
+            lab.top = max(0, int(b.top - lab.height - 35000))
+            changes += 1
+    return changes, missing_bars, missing_labels
+
+
+def update_dynamic_bars(prs, context):
+    """v07: update editable PowerPoint bar shapes by stable object names."""
+    values = context.get('_CHART_VALUES', {}) or {}
+    diagnostics = []
+    changes = 0
+    tag_diags = tag_chart_shapes(prs)
+    diagnostics.extend(tag_diags)
+    missing_total = 0
+    for key, slide_no, bar_names, label_names, bar_indices, label_indices in BAR_SPECS:
+        if slide_no > len(prs.slides):
+            diagnostics.append(f"{key}: slide {slide_no} no existe")
+            continue
+        changed, missing_bars, missing_labels = _scale_named_bar_group(
+            prs.slides[slide_no-1],
+            values.get(key, []),
+            bar_names,
+            label_names,
+            bar_indices,
+            label_indices,
+        )
+        changes += changed
+        missing_total += len(missing_bars)
+        if missing_bars:
+            diagnostics.append(f"{key}: barras faltantes: {', '.join(missing_bars)}")
+        else:
+            diagnostics.append(f"{key}: barras actualizadas OK ({len(bar_names)})")
+        if missing_labels:
+            diagnostics.append(f"{key}: labels faltantes: {', '.join(missing_labels)}")
+    context['_BAR_DIAGNOSTICS'] = diagnostics
+    context['_BAR_CHANGES'] = changes
+    context['_BAR_MISSING'] = missing_total
+    return changes
+
+
 def update_ppt(template_path, output_path, context):
     context = enrich_context(context)
     prs = Presentation(template_path)
@@ -599,25 +864,36 @@ def update_ppt(template_path, output_path, context):
                     for cell in row.cells:
                         changes += replace_text_in_shape(cell, context, text_map, state)
     tune_kpi_cards(prs)
+    changes += update_dynamic_bars(prs, context)
     prs.save(output_path)
     return changes
 
 
 def write_validation_report(path, ctx):
     warnings = ctx.get('_WARNINGS', [])
+    bar_diags = ctx.get('_BAR_DIAGNOSTICS', [])
     lines = []
-    lines.append("VALIDACION MAICAO AUTOMATION v04")
+    lines.append("VALIDACION MAICAO AUTOMATION v07")
     lines.append(f"Mes: {ctx.get('MES')}")
     lines.append("")
     if warnings:
-        lines.append("Estado: REVISAR")
+        lines.append("Estado data: REVISAR")
         lines.append("")
-        lines.append("Alertas:")
+        lines.append("Alertas de data:")
         for w in warnings:
             lines.append(f"- {w}")
     else:
-        lines.append("Estado: OK")
+        lines.append("Estado data: OK")
         lines.append("No se detectaron campos obligatorios faltantes.")
+    lines.append("")
+    lines.append("Estado barras dinamicas:")
+    lines.append(f"- Cambios aplicados: {ctx.get('_BAR_CHANGES', 0)}")
+    lines.append(f"- Barras faltantes: {ctx.get('_BAR_MISSING', 0)}")
+    if bar_diags:
+        for d in bar_diags:
+            lines.append(f"- {d}")
+    else:
+        lines.append("- No hay diagnostico de barras. Verifica que update_ppt haya corrido.")
     path.write_text("\n".join(lines), encoding='utf-8')
 
 
@@ -625,13 +901,12 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--input', default=str(ROOT / 'Maicao_Reporte_Automation_Model_v04.xlsx'))
     ap.add_argument('--template', default=str(ROOT / 'template' / 'Maicao_Template_Visual_v02.pptx'))
-    ap.add_argument('--output', default=str(ROOT / 'output' / 'Maicao_Reporte_Auto_Template_v04.pptx'))
+    ap.add_argument('--output', default=str(ROOT / 'output' / 'Maicao_Reporte_Auto_Template_v07.pptx'))
     ap.add_argument('--strict', action='store_true', help='Detener generacion si hay datos obligatorios faltantes.')
     args = ap.parse_args()
     ctx = build_context(args.input)
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
-    report_path = Path(args.output).parent / 'validation_report_v04.txt'
-    write_validation_report(report_path, ctx)
+    report_path = Path(args.output).parent / 'validation_report_v07.txt'
 
     warnings = ctx.get('_WARNINGS', [])
     if warnings:
@@ -646,9 +921,11 @@ def main():
         print("VALIDACION: OK")
 
     changes = update_ppt(args.template, args.output, ctx)
+    write_validation_report(report_path, ctx)
     print(f"OK: {args.output}")
     print(f"Text replacements applied: {changes}")
     print("Fuente KPI plataforma: Excel hoja 13_Platform_KPIs")
+    print(f"Barras dinamicas: {ctx.get('_BAR_CHANGES', 0)} cambios; faltantes {ctx.get('_BAR_MISSING', 0)}")
     print(f"Reporte de validacion: {report_path}")
 
 

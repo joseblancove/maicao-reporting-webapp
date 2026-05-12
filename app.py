@@ -1,5 +1,5 @@
 """
-Maicao Report Automation Web App v06
+Maicao Report Automation Web App v07
 
 Streamlit app to generate the Maicao monthly PPT report from either:
 1) an uploaded Excel model, or
@@ -28,7 +28,7 @@ from generate_report_from_template import build_context, update_ppt, write_valid
 ROOT = Path(__file__).resolve().parent
 DEFAULT_EXCEL = ROOT / "Maicao_Reporte_Automation_Model_v04.xlsx"
 DEFAULT_TEMPLATE = ROOT / "template" / "Maicao_Template_Visual_v02.pptx"
-DEFAULT_OUTPUT_NAME = "Maicao_Reporte_Auto_Web_v06.pptx"
+DEFAULT_OUTPUT_NAME = "Maicao_Reporte_Auto_Web_v07.pptx"
 
 REQUIRED_SHEETS = [
     "00_Control",
@@ -133,7 +133,7 @@ def generate_ppt(input_xlsx: Path, template_pptx: Path, strict: bool = False) ->
     with tempfile.TemporaryDirectory() as tmpdir:
         tmpdir_path = Path(tmpdir)
         output_pptx = tmpdir_path / DEFAULT_OUTPUT_NAME
-        validation_txt = tmpdir_path / "validation_report_v06.txt"
+        validation_txt = tmpdir_path / "validation_report_v07.txt"
         update_ppt(str(template_pptx), str(output_pptx), ctx)
         write_validation_report(validation_txt, ctx)
         return output_pptx.read_bytes(), validation_txt.read_text(encoding="utf-8"), warnings
@@ -151,7 +151,7 @@ def sheet_name_check(xlsx_path: Path) -> list[str]:
 
 st.set_page_config(page_title="Maicao Report Generator", page_icon="📊", layout="wide")
 
-st.title("Maicao Report Generator · v06")
+st.title("Maicao Report Generator · v07")
 st.caption("Google Sheets / Excel → PowerPoint editable · barras dinámicas")
 
 with st.sidebar:
@@ -170,7 +170,7 @@ with st.sidebar:
 st.markdown(
     """
 ### Flujo
-1. Actualiza el Google Sheet o Excel con el modelo v04/v05/v06.  
+1. Actualiza el Google Sheet o Excel con el modelo v04/v05/v07.  
 2. Carga la fuente de datos aquí.  
 3. Genera y descarga el PowerPoint editable.  
 """
