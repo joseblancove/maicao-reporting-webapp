@@ -1,20 +1,21 @@
 #!/usr/bin/env python3
 """
-Generador Maicao Visual v07
+Generador Maicao Visual v08
 
-Mejoras v07:
+Mejoras v08:
 - Validacion automatica antes de generar: avisa datos faltantes por hoja/plataforma/mes.
 - Fallback visual: si falta un dato, la PPT muestra "Dato pendiente".
 - Ajuste de tarjetas KPI para evitar que "vs mes anterior" se monte sobre el numero.
 - Normalizacion de mes: acepta texto tipo "Marzo 2026" o fechas Excel tipo "mar-26".
 - KPIs por plataforma desde Excel: hoja 13_Platform_KPIs.
 - Barras dinamicas como shapes: recalcula altos/posiciones desde la data.
+- Textos cualitativos dinamicos desde Google Sheets/Excel: hojas 15_Qualitative_Texts y 16_Action_Plan.
 
 Uso Terminal:
   python3 generate_report_from_template.py
 
 Salida default:
-  output/Maicao_Reporte_Auto_Template_v07.pptx
+  output/Maicao_Reporte_Auto_Template_v08.pptx
 """
 import argparse, json, re, sys
 from pathlib import Path
@@ -345,6 +346,63 @@ def filter_month_rows(wb, sheet_name, month, include_col=None):
     return rows
 
 
+def get_qualitative_texts(wb, month, warnings):
+    """Return a dict of placeholder -> text from 15_Qualitative_Texts.
+
+    Expected headers at row 4:
+    Mes | Slide | Seccion | Placeholder | Texto | Usar en PPT | Comentario
+    """
+    out = {}
+    sheet = '15_Qualitative_Texts'
+    if sheet not in wb.sheetnames:
+        warnings.append('Falta hoja 15_Qualitative_Texts para textos cualitativos.')
+        return out
+    for r in as_rows(wb[sheet]):
+        row_month = normalize_month(r.get('Mes'))
+        if row_month and row_month != month:
+            continue
+        if not yes(r.get('Usar en PPT')):
+            continue
+        key = str(r.get('Placeholder') or '').strip()
+        text = r.get('Texto')
+        if key:
+            out[key] = str(text) if not is_missing(text) else MISSING
+    return out
+
+
+def get_action_plan_texts(wb, month, warnings):
+    """Return placeholders for slide 12 from 16_Action_Plan."""
+    out = {}
+    sheet = '16_Action_Plan'
+    if sheet not in wb.sheetnames:
+        warnings.append('Falta hoja 16_Action_Plan para plan de accion.')
+        return out
+    rows = []
+    for r in as_rows(wb[sheet]):
+        row_month = normalize_month(r.get('Mes'))
+        if row_month and row_month != month:
+            continue
+        if not yes(r.get('Usar en PPT')):
+            continue
+        rows.append(r)
+    rows.sort(key=lambda r: int(to_float(r.get('Orden'), 999) or 999))
+    for idx, r in enumerate(rows[:4], start=1):
+        out[f'PLAN_{idx}_PILLAR'] = str(r.get('Pilar') or MISSING)
+        out[f'PLAN_{idx}_ACTION'] = str(r.get('Accion') or r.get('Acción') or MISSING)
+        meta = r.get('Meta')
+        out[f'PLAN_{idx}_META'] = str(meta) if not is_missing(meta) else MISSING
+    # Optional KPI control line. If any row contains KPIs de control, prefer it.
+    kpi_line = None
+    for r in rows:
+        if not is_missing(r.get('KPIs de control')):
+            kpi_line = r.get('KPIs de control')
+            break
+    if kpi_line:
+        text = str(kpi_line)
+        out['PLAN_KPIS_CONTROL'] = text if text.lower().startswith('kpis de control') else f'KPIs de control: {text}'
+    return out
+
+
 def build_context(xlsx_path):
     defaults = json.loads(DEFAULTS_PATH.read_text(encoding='utf-8'))
     wb = load_workbook(xlsx_path, data_only=True)
@@ -515,7 +573,15 @@ def build_context(xlsx_path):
         'MMPP_CONTENTS': fmt_int(mmpp.get('Contenidos')),
         'MMPP_COMMENT': mmpp.get('Comentario general') or MISSING,
     })
-    # Numeric values used by v07 to resize bars/shapes dynamically.
+
+    # v08: dynamic qualitative copy from the Google Sheet / Excel model.
+    # Keys in the sheet are already aligned to tokens used by the PPT mapping.
+    qualitative = get_qualitative_texts(wb, month, warnings)
+    action_plan = get_action_plan_texts(wb, month, warnings)
+    ctx.update(qualitative)
+    ctx.update(action_plan)
+
+    # Numeric values used by v08 to resize bars/shapes dynamically.
     def pv(platform, field):
         return to_float(platform_kpis.get(platform, {}).get(field), 0)
 
@@ -569,6 +635,88 @@ SLIDE_TEXT_TO_TOKEN = {
     9: {
         '4.637.075': 'SQUAD_VIEWS','2.020.826': 'SQUAD_REACH','60.146': 'SQUAD_INTERACTIONS','3,0%': 'SQUAD_ER','2,05M': 'SKAR_VIEWS_M','88K': 'BUSQUI_VIEWS_M','811K': 'CAMI_VIEWS_M','1,69M': 'DISLEY_VIEWS_M','4,5%': 'SKAR_ER','1,1%': 'BUSQUI_ER','0,8%': 'CAMI_ER','2,2%': 'DISLEY_ER'},
     10: {'3.336.786': 'MMPP_VIEWS','1.443.025': 'MMPP_REACH','13.463': 'MMPP_INTERACTIONS','1,0%': 'MMPP_ER','Mix de 14 contenidos': 'MMPP_CONTENTS_LINE'},
+}
+
+
+# v08: qualitative text mapping. These map existing template text fragments to
+# editable placeholders in 15_Qualitative_Texts / 16_Action_Plan.
+QUALITATIVE_TEXT_TO_TOKEN = {
+    2: {
+        'La inversión amplificó la visibilidad, pero el engagement cayó por cambio de contexto: de festivales/verano a vuelta a la rutina. La prioridad ahora es retención y conversación, no solo alcance.': 'EXEC_BUSINESS_READING',
+        'Más alcance pagado': 'EXEC_TAG_1',
+        'Menos chispa orgánica': 'EXEC_TAG_2',
+        'TikTok motor': 'EXEC_TAG_3',
+    },
+    3: {
+        'Cambio de temporada': 'CHANGE_TITLE_1',
+        'La conversación espontánea bajó al salir de hitos de alto interés como festivales/verano.': 'CHANGE_BODY_1',
+        'Inversión crece': 'CHANGE_TITLE_2',
+        'El paid empuja visibilidad (+24,5% views), pero diluye la tasa al abrir públicos menos fidelizados.': 'CHANGE_BODY_2',
+        'Nuevo mix creativo': 'CHANGE_TITLE_3',
+        'EGC, UGC y creators acercan la marca. Los contenidos útiles y auténticos son los que más se guardan/comentan.': 'CHANGE_BODY_3',
+        'Decisión recomendada: mantener escala, pero rediseñar el contenido para retener: hooks de 3 segundos + contenido útil + CTA conversacional.': 'CHANGE_DECISION',
+    },
+    4: {
+        'Inspiración + cultura pop': 'ROLE_INSTAGRAM',
+        'Comunidad masiva + ofertas': 'ROLE_FACEBOOK',
+        'Descubrimiento + contenido útil': 'ROLE_TIKTOK',
+        'Lectura: IG concentra visibilidad e interacción; Facebook sostiene comunidad y alcance eficiente; TikTok es la apuesta de crecimiento cualitativo por autenticidad.': 'PORTFOLIO_READING',
+    },
+    5: {
+        '• Colaboraciones con creadoras: empujan comentarios desde sus comunidades.': 'IG_WHAT_WORKED_1',
+        '• Cultura pop y educativo: contenido tipo “Te enseño a...” genera valor y conversión.': 'IG_WHAT_WORKED_2',
+        '• Audiencia femenina dominante: 92,3% mujeres; mayor foco 25-34.': 'IG_WHAT_WORKED_3',
+        'Pasar de piezas aisladas a series guardables: tutoriales, comparativas, hacks y CTA de conversación.': 'IG_OPTIMIZATION',
+    },
+    6: {
+        'Facebook sigue siendo el canal de comunidad más grande. Las piezas de oferta generan mayor reacción y conversación, especialmente cuando el beneficio es directo.': 'FB_VISUAL_READING',
+        'Las stories no tienen totales completos por error de plataforma antes del 20 de marzo.': 'FB_DATA_NOTE',
+    },
+    7: {
+        'Funciona cuando habla el lenguaje de la plataforma: auténtico, real, educativo y menos publicitario.': 'TT_CONTENT_PRINCIPLE',
+        'Replicar contenidos de trabajadoras y formatos con datos, precios y beneficios concretos. Potenciar CTA a comentar, guardar y seguir.': 'TT_OPPORTUNITY',
+    },
+    8: {
+        'Volumen, frecuencia y exposición continua.': 'TT_MIX_UGC_DESC',
+        'Cercanía, confianza y conversación con consejeras.': 'TT_MIX_EGC_DESC',
+        'Menor volumen, mayor engagement por oportunidad cultural.': 'TT_MIX_CAMPAIGN_DESC',
+        'Lectura: UGC debe seguir alimentando volumen; EGC debe usarse para confianza; campañas deben seleccionarse por oportunidad de conversación, no solo por calendario.': 'TT_MIX_READING',
+    },
+    9: {
+        'Skar sostiene interacción alta; Disley abre volumen nuevo con tono humorístico y cercano. Para próximos meses, combinar perfiles de alto alcance con micro-nichos de expertise.': 'SQUAD_LEARNING',
+        '70% creators de performance, 20% nichos estratégicos, 10% apuestas en tendencia.': 'SQUAD_RULE',
+    },
+    10: {
+        'El mix permitió ampliar la presencia de productos, con comentarios positivos asociados a calidad y precios. El contenido tiene potencial para crecer si se empaqueta en series de beneficios concretos.': 'MMPP_QUAL_READING',
+        'Calidad': 'MMPP_TAG_1',
+        'Precio': 'MMPP_TAG_2',
+        'Valor práctico': 'MMPP_TAG_3',
+        'Próximo paso: convertir menciones de marca propia en “pruebas visuales” comparativas: antes/después, precio vs resultado, rutina completa.': 'MMPP_NEXT_STEP',
+    },
+    11: {
+        'Liderazgo': 'COMP_FB_TITLE',
+        'Maicao lidera comunidad; crecimiento estable, oportunidad en oferta y contenido gráfico.': 'COMP_FB_BODY',
+        'Posición intermedia': 'COMP_IG_TITLE',
+        'DBS domina estética; Maicao crece con contenido y creators.': 'COMP_IG_BODY',
+        'Brecha de crecimiento': 'COMP_TT_TITLE',
+        'Dr. Simi y el contenido social/humano marcan la conversación; Maicao tiene el mayor espacio para posicionarse.': 'COMP_TT_BODY',
+        'Competidores activan Pinterest-like, creators, eventos y contenido humano. Maicao puede diferenciarse con utilidad + cercanía + retail expertise.': 'COMP_BENCHMARK',
+    },
+    12: {
+        'Retención': 'PLAN_1_PILLAR',
+        'Hooks de 3 segundos, captions con promesa clara y edición nativa para cada plataforma.': 'PLAN_1_ACTION',
+        'Meta: subir ER': 'PLAN_1_META',
+        'Contenido útil': 'PLAN_2_PILLAR',
+        'Series guardables: tutoriales, hacks, “precio vs resultado”, rutinas y comparativas.': 'PLAN_2_ACTION',
+        'Meta: más guardados': 'PLAN_2_META',
+        'Conversación': 'PLAN_3_PILLAR',
+        'CTA de comentario y votación. Preguntas directas por edad, necesidad y ocasión de uso.': 'PLAN_3_ACTION',
+        'Meta: interacción real': 'PLAN_3_META',
+        'Nichos': 'PLAN_4_PILLAR',
+        'Talentos de skincare, maquillaje pro y Gen Z. Activaciones ocasionales con perfiles en tendencia.': 'PLAN_4_ACTION',
+        'Meta: relevancia': 'PLAN_4_META',
+        'KPIs de control: ER por formato · guardados por contenido · retención de video · crecimiento de seguidores · ratio paid/orgánico': 'PLAN_KPIS_CONTROL',
+    },
 }
 
 
@@ -650,9 +798,9 @@ def tune_kpi_cards(prs):
 
 
 # -----------------------------------------------------------------------------
-# Dynamic chart bars v07
+# Dynamic chart bars v08
 # -----------------------------------------------------------------------------
-# v07 stops relying on the internal PowerPoint shape order at runtime.
+# v08 stops relying on the internal PowerPoint shape order at runtime.
 # It tags bars/labels with stable technical names and then updates shapes by name.
 # If a template is still untagged, it will tag the known v02/v06 template once using
 # the fallback indices below. After that, charts are robust to minor position edits.
@@ -816,7 +964,7 @@ def _scale_named_bar_group(slide, values, bar_names, label_names=None, fallback_
 
 
 def update_dynamic_bars(prs, context):
-    """v07: update editable PowerPoint bar shapes by stable object names."""
+    """v08: update editable PowerPoint bar shapes by stable object names."""
     values = context.get('_CHART_VALUES', {}) or {}
     diagnostics = []
     changes = 0
@@ -856,6 +1004,7 @@ def update_ppt(template_path, output_path, context):
     for idx, slide in enumerate(prs.slides, start=1):
         text_map = dict(GLOBAL_TEXT_TO_TOKEN)
         text_map.update(SLIDE_TEXT_TO_TOKEN.get(idx, {}))
+        text_map.update(QUALITATIVE_TEXT_TO_TOKEN.get(idx, {}))
         state = {}
         for shape in slide.shapes:
             changes += replace_text_in_shape(shape, context, text_map, state)
@@ -873,7 +1022,7 @@ def write_validation_report(path, ctx):
     warnings = ctx.get('_WARNINGS', [])
     bar_diags = ctx.get('_BAR_DIAGNOSTICS', [])
     lines = []
-    lines.append("VALIDACION MAICAO AUTOMATION v07")
+    lines.append("VALIDACION MAICAO AUTOMATION v08")
     lines.append(f"Mes: {ctx.get('MES')}")
     lines.append("")
     if warnings:
@@ -885,6 +1034,11 @@ def write_validation_report(path, ctx):
     else:
         lines.append("Estado data: OK")
         lines.append("No se detectaron campos obligatorios faltantes.")
+    lines.append("")
+    lines.append("Estado textos cualitativos:")
+    qualitative_keys = [k for k in ctx.keys() if k.isupper() and (k.startswith(('EXEC_', 'CHANGE_', 'ROLE_', 'PORTFOLIO_', 'IG_', 'FB_', 'TT_', 'SQUAD_', 'MMPP_', 'COMP_', 'PLAN_')))]
+    qual_values = [ctx.get(k) for k in qualitative_keys if k not in {'IG_VIEWS','IG_REACH','IG_INTERACTIONS','IG_ER','FB_VIEWS','FB_REACH','FB_INTERACTIONS','FB_ER','TT_VIEWS','TT_REACH','TT_INTERACTIONS','TT_ER','SQUAD_VIEWS','SQUAD_REACH','SQUAD_INTERACTIONS','SQUAD_ER','MMPP_VIEWS','MMPP_REACH','MMPP_INTERACTIONS','MMPP_ER'}]
+    lines.append(f"- Campos cualitativos cargados: {sum(1 for v in qual_values if v not in [None, '', MISSING])}")
     lines.append("")
     lines.append("Estado barras dinamicas:")
     lines.append(f"- Cambios aplicados: {ctx.get('_BAR_CHANGES', 0)}")
@@ -899,14 +1053,14 @@ def write_validation_report(path, ctx):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--input', default=str(ROOT / 'Maicao_Reporte_Automation_Model_v04.xlsx'))
+    ap.add_argument('--input', default=str(ROOT / 'Maicao_Reporte_Automation_Model_v08.xlsx'))
     ap.add_argument('--template', default=str(ROOT / 'template' / 'Maicao_Template_Visual_v02.pptx'))
-    ap.add_argument('--output', default=str(ROOT / 'output' / 'Maicao_Reporte_Auto_Template_v07.pptx'))
+    ap.add_argument('--output', default=str(ROOT / 'output' / 'Maicao_Reporte_Auto_Template_v08.pptx'))
     ap.add_argument('--strict', action='store_true', help='Detener generacion si hay datos obligatorios faltantes.')
     args = ap.parse_args()
     ctx = build_context(args.input)
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
-    report_path = Path(args.output).parent / 'validation_report_v07.txt'
+    report_path = Path(args.output).parent / 'validation_report_v08.txt'
 
     warnings = ctx.get('_WARNINGS', [])
     if warnings:

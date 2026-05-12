@@ -1,5 +1,5 @@
 """
-Maicao Report Automation Web App v07
+Maicao Report Automation Web App v08
 
 Streamlit app to generate the Maicao monthly PPT report from either:
 1) an uploaded Excel model, or
@@ -26,9 +26,9 @@ from openpyxl import Workbook
 from generate_report_from_template import build_context, update_ppt, write_validation_report
 
 ROOT = Path(__file__).resolve().parent
-DEFAULT_EXCEL = ROOT / "Maicao_Reporte_Automation_Model_v04.xlsx"
+DEFAULT_EXCEL = ROOT / "Maicao_Reporte_Automation_Model_v08.xlsx"
 DEFAULT_TEMPLATE = ROOT / "template" / "Maicao_Template_Visual_v02.pptx"
-DEFAULT_OUTPUT_NAME = "Maicao_Reporte_Auto_Web_v07.pptx"
+DEFAULT_OUTPUT_NAME = "Maicao_Reporte_Auto_Web_v08.pptx"
 
 REQUIRED_SHEETS = [
     "00_Control",
@@ -40,6 +40,8 @@ REQUIRED_SHEETS = [
     "08_Recomendaciones",
     "09_Validaciones",
     "13_Platform_KPIs",
+    "15_Qualitative_Texts",
+    "16_Action_Plan",
 ]
 
 
@@ -133,7 +135,7 @@ def generate_ppt(input_xlsx: Path, template_pptx: Path, strict: bool = False) ->
     with tempfile.TemporaryDirectory() as tmpdir:
         tmpdir_path = Path(tmpdir)
         output_pptx = tmpdir_path / DEFAULT_OUTPUT_NAME
-        validation_txt = tmpdir_path / "validation_report_v07.txt"
+        validation_txt = tmpdir_path / "validation_report_v08.txt"
         update_ppt(str(template_pptx), str(output_pptx), ctx)
         write_validation_report(validation_txt, ctx)
         return output_pptx.read_bytes(), validation_txt.read_text(encoding="utf-8"), warnings
@@ -151,8 +153,8 @@ def sheet_name_check(xlsx_path: Path) -> list[str]:
 
 st.set_page_config(page_title="Maicao Report Generator", page_icon="📊", layout="wide")
 
-st.title("Maicao Report Generator · v07")
-st.caption("Google Sheets / Excel → PowerPoint editable · barras dinámicas")
+st.title("Maicao Report Generator · v08")
+st.caption("Google Sheets / Excel → PowerPoint editable · barras y textos cualitativos dinámicos")
 
 with st.sidebar:
     st.header("Fuente de datos")
@@ -170,7 +172,7 @@ with st.sidebar:
 st.markdown(
     """
 ### Flujo
-1. Actualiza el Google Sheet o Excel con el modelo v04/v05/v07.  
+1. Actualiza el Google Sheet o Excel con el modelo v08.  
 2. Carga la fuente de datos aquí.  
 3. Genera y descarga el PowerPoint editable.  
 """
@@ -264,5 +266,7 @@ st.markdown(
 - La hoja `13_Platform_KPIs` alimenta KPIs y barras por Instagram, Facebook y TikTok.  
 - La hoja `02_Audience` alimenta seguidores y demografía.  
 - La hoja `09_Validaciones` alimenta el overview ejecutivo.  
+- La hoja `15_Qualitative_Texts` alimenta insights, lecturas y textos cualitativos por slide.  
+- La hoja `16_Action_Plan` alimenta la slide final de plan de acción.  
 """
 )
