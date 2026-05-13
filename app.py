@@ -56,7 +56,8 @@ PLATFORM_ROWS = [
 TEXT_PREVIEW_KEYS = [
     ("Dashboard", "Lectura de negocio", "EXEC_BUSINESS_READING"),
     ("Qué cambió", "Decisión recomendada", "CHANGE_DECISION"),
-    ("Instagram", "Qué funcionó", "IG_WHAT_WORKED"),
+    # Instagram "Qué funcionó" is composed of 3 bullet rows in 15_Qualitative_Texts.
+    ("Instagram", "Qué funcionó", ["IG_WHAT_WORKED", "IG_WHAT_WORKED_1", "IG_WHAT_WORKED_2", "IG_WHAT_WORKED_3"]),
     ("Instagram", "Optimización", "IG_OPTIMIZATION"),
     ("Facebook", "Lectura visual", "FB_VISUAL_READING"),
     ("TikTok", "Principio de contenido", "TT_CONTENT_PRINCIPLE"),
@@ -439,11 +440,32 @@ def render_chart_previews(ctx: Dict[str, Any]) -> None:
         st.bar_chart(chart_df(ctx, "slide9_er", ["Skarleth", "Busquilla", "Cami", "Disley"]), height=260)
 
 
+def resolve_preview_text(ctx: Dict[str, Any], key_spec: Any) -> str:
+    """Resolve a text preview item.
+
+    key_spec can be a string key or a list of keys. Lists are useful when one
+    visible text block in the PPT is built from multiple rows in
+    15_Qualitative_Texts, for example Instagram "Qué funcionó".
+    """
+    if isinstance(key_spec, (list, tuple)):
+        # If a consolidated key exists, prefer it. Otherwise join bullet keys.
+        first = ctx.get(key_spec[0]) if key_spec else None
+        if first and first != "Dato pendiente":
+            return str(first)
+        parts = []
+        for k in key_spec[1:]:
+            val = ctx.get(k)
+            if val and val != "Dato pendiente":
+                parts.append(str(val))
+        return "\n".join(parts) if parts else "Dato pendiente"
+    return ctx.get(key_spec, "Dato pendiente")
+
+
 def render_text_previews(ctx: Dict[str, Any]) -> None:
     st.markdown('<div class="section-title">Textos cualitativos que irán al PPT</div>', unsafe_allow_html=True)
     rows = []
     for section, title, key in TEXT_PREVIEW_KEYS:
-        rows.append((section, title, ctx.get(key, "Dato pendiente")))
+        rows.append((section, title, resolve_preview_text(ctx, key)))
     for i in range(0, len(rows), 2):
         cols = st.columns(2)
         for col, item in zip(cols, rows[i : i + 2]):
