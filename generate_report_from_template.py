@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Generador Maicao Visual v08
+Generador Maicao Visual v12
 
-Mejoras v08:
+Mejoras v12:
 - Validacion automatica antes de generar: avisa datos faltantes por hoja/plataforma/mes.
 - Fallback visual: si falta un dato, la PPT muestra "Dato pendiente".
 - Ajuste de tarjetas KPI para evitar que "vs mes anterior" se monte sobre el numero.
@@ -15,7 +15,7 @@ Uso Terminal:
   python3 generate_report_from_template.py
 
 Salida default:
-  output/Maicao_Reporte_Auto_Template_v08.pptx
+  output/Maicao_Reporte_Auto_Template_v12.pptx
 """
 import argparse, json, re, sys
 from pathlib import Path
@@ -23,6 +23,7 @@ from datetime import datetime, date
 from openpyxl import load_workbook
 from pptx import Presentation
 from pptx.util import Pt, Inches
+from media_utils import enrich_media_context, append_media_slides
 
 ROOT = Path(__file__).resolve().parent
 DEFAULTS_PATH = ROOT / "config" / "defaults.json"
@@ -187,29 +188,111 @@ def yes(v):
     return str(v).strip().lower() in ["si", "sí", "yes", "true", "1", "x"]
 
 
+def _normalize_row_aliases(row):
+    """Add backwards-compatible aliases so the app supports both v08/v11 Spanish headers and v12 snake_case headers."""
+    aliases = {
+        'month': 'Mes', 'platform': 'Plataforma', 'views': 'Views', 'reach': 'Alcance',
+        'interactions': 'Interacciones', 'contents': 'Contenidos', 'budget': 'Presupuesto',
+        'views_prev': 'Views mes anterior', 'reach_prev': 'Alcance mes anterior',
+        'interactions_prev': 'Interacciones mes anterior', 'er': 'ER %', 'er_prev': 'ER % mes anterior',
+        'contents_prev': 'Contenidos mes anterior', 'budget_prev': 'Presupuesto mes anterior',
+        'followers': 'Seguidores', 'followers_prev': 'Seguidores mes anterior', 'growth': 'Crecimiento',
+        'women_pct': 'Mujeres %', 'men_pct': 'Hombres %', 'age_18_24': '18-24 %',
+        'age_25_34': '25-34 %', 'age_35_44': '35-44 %', 'age_45_54': '45-54 %', 'age_55_plus': '55+ %',
+        'amount': 'Monto', 'amount_prev': 'Monto mes anterior', 'include_overview': 'Incluir Overview',
+        'member': 'Miembro', 'display_name': 'Talento', 'active': 'Incluir PPT',
+        'display_name': 'Talento', 'brand': 'Marca', 'summary': 'Comentario general',
+        'placeholder': 'Placeholder', 'text': 'Texto', 'use_in_ppt': 'Usar en PPT', 'active': 'Usar en PPT',
+        'order': 'Orden', 'pillar': 'Pilar', 'action': 'Accion', 'goal': 'Meta',
+        'kpi_focus': 'KPIs de control',
+    }
+    for src, dst in aliases.items():
+        if dst not in row and src in row:
+            row[dst] = row.get(src)
+    # v12 squad member aliases to legacy full names used by original generator.
+    if '04_Squad' not in row.get('_sheet_name', ''):
+        pass
+    if row.get('member') and row.get('Talento'):
+        m = str(row.get('member')).strip().lower()
+        full = {'skar': 'Skarleth Labra', 'busquilla': 'Busquilla', 'cami': 'Camila Andrade', 'disley': 'Disley Ramos'}.get(m)
+        if full:
+            row['Talento'] = full
+    # v12 paid media: platform rows should also be included in platform budget unless it is Squad.
+    if 'Incluir Plataforma' not in row:
+        row['Incluir Plataforma'] = row.get('Plataforma') not in [None, '', 'Squad']
+    # v12 raw content aliases for fallback logic.
+    if 'include_platform' in row and 'Incluir Plataforma' not in row:
+        row['Incluir Plataforma'] = row.get('include_platform')
+    if 'include_overview' in row and 'Incluir Overview' not in row:
+        row['Incluir Overview'] = row.get('include_overview')
+    if 'content_type' in row and 'Formato' not in row:
+        row['Formato'] = row.get('content_type')
+    if 'views' in row and 'Visualizaciones' not in row:
+        row['Visualizaciones'] = row.get('views')
+    if 'interactions' in row and 'Interacciones totales' not in row:
+        row['Interacciones totales'] = row.get('interactions')
+    return row
+
+
+def _detect_header_row(ws, preferred=4):
+    candidates = [preferred, 1, 2, 3, 5]
+    seen = set()
+    for r in candidates:
+        if r in seen or r < 1 or r > ws.max_row:
+            continue
+        seen.add(r)
+        vals = [c.value for c in ws[r]]
+        labels = {str(v).strip().lower() for v in vals if v is not None}
+        # v12 snake_case headers or v08 Spanish headers.
+        if {'month', 'platform'} & labels or {'mes', 'plataforma'} <= labels or {'campo', 'valor'} <= labels:
+            return r
+    return preferred if preferred <= ws.max_row else 1
+
+
 def as_rows(ws, header_row=4):
+    header_row = _detect_header_row(ws, header_row)
     headers = [c.value for c in ws[header_row]]
     rows = []
     for r in ws.iter_rows(min_row=header_row+1, values_only=True):
         if not any(v is not None for v in r):
             continue
-        rows.append({headers[i]: r[i] if i < len(r) else None for i in range(len(headers)) if headers[i] is not None})
+        row = {str(headers[i]).strip(): r[i] if i < len(r) else None for i in range(len(headers)) if headers[i] is not None}
+        row['_sheet_name'] = ws.title
+        rows.append(_normalize_row_aliases(row))
     return rows
 
 
 def control_dict(wb):
     ws = wb['00_Control']
     d = {}
-    for row in ws.iter_rows(min_row=5, max_col=2, values_only=True):
-        if row[0]:
-            d[str(row[0])] = row[1]
+    # v12: row 1 headers Campo / Valor. Legacy: values start row 5.
+    rows = as_rows(ws, header_row=1)
+    if rows and ('Campo' in rows[0] or 'field' in rows[0]):
+        for r in rows:
+            key = r.get('Campo') or r.get('field')
+            val = r.get('Valor') if 'Valor' in r else r.get('value')
+            if key:
+                d[str(key)] = val
+    else:
+        for row in ws.iter_rows(min_row=5, max_col=2, values_only=True):
+            if row[0]:
+                d[str(row[0])] = row[1]
     return d
 
 
 def validation_value(wb, metric, prefer_expected=True):
     ws = wb['09_Validaciones']
+    # v12 layout: metric | value | previous_value | variation
+    metric_map = {'Views':'views_total', 'Alcance':'reach_total', 'Interacciones':'interactions_total', 'Contenidos':'contents_total', 'ER':'er_total', 'Inversion':'investment_total'}
+    rows = as_rows(ws, header_row=1)
+    if rows and ('metric' in rows[0] or 'Metric' in rows[0]):
+        want = metric_map.get(metric, metric)
+        for r in rows:
+            if str(r.get('metric') or '').strip() == want:
+                return r.get('value')
+    # legacy layout.
     for row in ws.iter_rows(min_row=5, values_only=True):
-        if row[1] == metric:
+        if len(row) > 3 and row[1] == metric:
             return row[3] if prefer_expected and row[3] is not None else row[2]
     return None
 
@@ -408,8 +491,8 @@ def build_context(xlsx_path):
     wb = load_workbook(xlsx_path, data_only=True)
     warnings = []
     ctrl = control_dict(wb)
-    month = normalize_month(ctrl.get('Mes actual') or 'Marzo 2026')
-    prev_month = normalize_month(ctrl.get('Mes anterior') or 'Febrero 2026')
+    month = normalize_month(ctrl.get('Mes actual') or ctrl.get('active_month') or 'Marzo 2026')
+    prev_month = normalize_month(ctrl.get('Mes anterior') or ctrl.get('previous_month') or 'Febrero 2026')
     prev_label = month_short(prev_month)
     month_upper = month.split()[0].upper() if month else MISSING
     prev = defaults['previous_month']
@@ -471,12 +554,12 @@ def build_context(xlsx_path):
         warnings.append(f"Falta fila activa en 05_MMPP para {month}.")
 
     ctx = {
-        'CLIENTE': ctrl.get('Cliente') or 'Maicao',
+        'CLIENTE': ctrl.get('Cliente') or ctrl.get('client_name') or 'Maicao',
         'MES': month or MISSING,
         'MES_UPPER': month_upper,
         'MES_PREV': prev_month or MISSING,
         'MES_PREV_LABEL': prev_label,
-        'TITLE_META': f"{ctrl.get('Cliente') or 'Maicao'} · {month}",
+        'TITLE_META': f"{ctrl.get('Cliente') or ctrl.get('client_name') or 'Maicao'} · {month}",
         'OVERVIEW_VIEWS': fmt_int(overview['views']),
         'OVERVIEW_VIEWS_M': fmt_m(overview['views']),
         'OVERVIEW_REACH': fmt_int(overview['reach']),
@@ -603,6 +686,9 @@ def build_context(xlsx_path):
         'slide9_views': [to_float(squad.get('Skarleth Labra', {}).get('Views'), 0), to_float(squad.get('Busquilla', {}).get('Views'), 0), to_float(squad.get('Camila Andrade', {}).get('Views'), 0), to_float(squad.get('Disley Ramos', {}).get('Views'), 0)],
         'slide9_er': [to_float(squad.get('Skarleth Labra', {}).get('ER %'), 0), to_float(squad.get('Busquilla', {}).get('ER %'), 0), to_float(squad.get('Camila Andrade', {}).get('ER %'), 0), to_float(squad.get('Disley Ramos', {}).get('ER %'), 0)],
     }
+
+    # v12: media/assets context for Top 3, MMPP, Squad and Competition visual slides.
+    ctx = enrich_media_context(wb, ctx, month, ctrl, warnings)
 
     ctx['_WARNINGS'] = warnings
     return ctx
@@ -997,7 +1083,7 @@ def update_dynamic_bars(prs, context):
     return changes
 
 
-def update_ppt(template_path, output_path, context):
+def update_ppt(template_path, output_path, context, asset_service_account_info=None):
     context = enrich_context(context)
     prs = Presentation(template_path)
     changes = 0
@@ -1014,6 +1100,7 @@ def update_ppt(template_path, output_path, context):
                         changes += replace_text_in_shape(cell, context, text_map, state)
     tune_kpi_cards(prs)
     changes += update_dynamic_bars(prs, context)
+    context['_MEDIA_SLIDES_ADDED'] = append_media_slides(prs, context, asset_service_account_info)
     prs.save(output_path)
     return changes
 
@@ -1022,7 +1109,7 @@ def write_validation_report(path, ctx):
     warnings = ctx.get('_WARNINGS', [])
     bar_diags = ctx.get('_BAR_DIAGNOSTICS', [])
     lines = []
-    lines.append("VALIDACION MAICAO AUTOMATION v08")
+    lines.append("VALIDACION MAICAO REPORTING STUDIO v12")
     lines.append(f"Mes: {ctx.get('MES')}")
     lines.append("")
     if warnings:
@@ -1048,19 +1135,25 @@ def write_validation_report(path, ctx):
             lines.append(f"- {d}")
     else:
         lines.append("- No hay diagnostico de barras. Verifica que update_ppt haya corrido.")
+    lines.append("")
+    lines.append("Estado media/assets:")
+    lines.append(f"- Slides visuales agregadas: {ctx.get('_MEDIA_SLIDES_ADDED', 0)}")
+    top3 = ctx.get('_TOP3_MEDIA', {}) or {}
+    for platform, items in top3.items():
+        lines.append(f"- Top 3 {platform}: {len(items)}/3 piezas")
     path.write_text("\n".join(lines), encoding='utf-8')
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--input', default=str(ROOT / 'Maicao_Reporte_Automation_Model_v08.xlsx'))
+    ap.add_argument('--input', default=str(ROOT / 'Maicao_Reporte_Input_Model_v12_MEDIA_BLUEPRINT.xlsx'))
     ap.add_argument('--template', default=str(ROOT / 'template' / 'Maicao_Template_Visual_v02.pptx'))
-    ap.add_argument('--output', default=str(ROOT / 'output' / 'Maicao_Reporte_Auto_Template_v08.pptx'))
+    ap.add_argument('--output', default=str(ROOT / 'output' / 'Maicao_Reporte_Auto_Template_v12.pptx'))
     ap.add_argument('--strict', action='store_true', help='Detener generacion si hay datos obligatorios faltantes.')
     args = ap.parse_args()
     ctx = build_context(args.input)
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
-    report_path = Path(args.output).parent / 'validation_report_v08.txt'
+    report_path = Path(args.output).parent / 'validation_report_v12.txt'
 
     warnings = ctx.get('_WARNINGS', [])
     if warnings:

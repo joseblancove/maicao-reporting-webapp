@@ -1,5 +1,5 @@
 """
-Maicao Reporting Studio v11
+Maicao Reporting Studio v12
 
 Professional Streamlit UI for generating the Maicao monthly PPT report from
 Google Sheets or an uploaded Excel model, with preview/QA before download.
@@ -21,9 +21,9 @@ from openpyxl import Workbook, load_workbook
 from generate_report_from_template import build_context, update_ppt, write_validation_report
 
 ROOT = Path(__file__).resolve().parent
-DEFAULT_EXCEL = ROOT / "Maicao_Reporte_Input_Model_v11_OPERATIVO.xlsx"
+DEFAULT_EXCEL = ROOT / "Maicao_Reporte_Input_Model_v12_MEDIA_BLUEPRINT.xlsx"
 DEFAULT_TEMPLATE = ROOT / "template" / "Maicao_Template_Visual_v02.pptx"
-DEFAULT_OUTPUT_NAME = "Maicao_Reporte_Mensual_Maicao.pptx"
+DEFAULT_OUTPUT_NAME = "Maicao_Reporte_Mensual_Maicao_v12.pptx"
 
 REQUIRED_SHEETS = [
     "00_Control",
@@ -37,6 +37,10 @@ REQUIRED_SHEETS = [
     "13_Platform_KPIs",
     "15_Qualitative_Texts",
     "16_Action_Plan",
+    "20_Squad_Assets",
+    "21_MMPP_Assets",
+    "22_Competition_Assets",
+    "23_Content_Notes",
 ]
 
 KPI_ORDER = [
@@ -56,8 +60,7 @@ PLATFORM_ROWS = [
 TEXT_PREVIEW_KEYS = [
     ("Dashboard", "Lectura de negocio", "EXEC_BUSINESS_READING"),
     ("Qué cambió", "Decisión recomendada", "CHANGE_DECISION"),
-    # Instagram "Qué funcionó" is composed of 3 bullet rows in 15_Qualitative_Texts.
-    ("Instagram", "Qué funcionó", ["IG_WHAT_WORKED", "IG_WHAT_WORKED_1", "IG_WHAT_WORKED_2", "IG_WHAT_WORKED_3"]),
+    ("Instagram", "Qué funcionó", "IG_WHAT_WORKED"),
     ("Instagram", "Optimización", "IG_OPTIMIZATION"),
     ("Facebook", "Lectura visual", "FB_VISUAL_READING"),
     ("TikTok", "Principio de contenido", "TT_CONTENT_PRINCIPLE"),
@@ -175,6 +178,9 @@ def inject_css() -> None:
         .text-section { color: var(--maicao-pink); font-size:.78rem; font-weight:900; text-transform:uppercase; letter-spacing:.08em; }
         .text-title { color: var(--maicao-navy); font-weight:900; font-size:1rem; margin-top:6px; }
         .text-body { color:#20243A; margin-top:10px; font-size:.92rem; line-height:1.42; white-space:pre-line; }
+        .media-card { background:#fff; border:1px solid var(--maicao-border); border-radius:18px; padding:14px; box-shadow:0 8px 22px rgba(17,22,45,.04); min-height:280px; }
+        .media-title { font-weight:900; color:var(--maicao-navy); font-size:.95rem; margin-top:8px; }
+        .media-meta { color:var(--maicao-muted); font-size:.82rem; font-weight:700; margin-top:4px; }
         .help-box { background:#fff; border:1px solid var(--maicao-border); border-left:4px solid var(--maicao-pink); padding:16px 18px; border-radius:16px; }
         .footer-note { text-align:center; color:var(--maicao-muted); margin-top:2rem; font-size:.86rem; }
         div.stButton > button:first-child {
@@ -300,7 +306,7 @@ def analyze_xlsx(xlsx_bytes: bytes) -> Tuple[Dict[str, Any], list[str]]:
         return ctx, missing
 
 
-def generate_ppt_from_bytes(xlsx_bytes: bytes, strict: bool = False) -> tuple[bytes, str, list[str]]:
+def generate_ppt_from_bytes(xlsx_bytes: bytes, strict: bool = False, asset_service_account_info: Optional[Dict[str, Any]] = None) -> tuple[bytes, str, list[str]]:
     with tempfile.TemporaryDirectory() as tmpdir:
         tmpdir_path = Path(tmpdir)
         input_xlsx = tmpdir_path / "input.xlsx"
@@ -312,7 +318,7 @@ def generate_ppt_from_bytes(xlsx_bytes: bytes, strict: bool = False) -> tuple[by
         if strict and warnings:
             validation_txt.write_text("VALIDACION: REVISAR\n\n" + "\n".join(f"- {w}" for w in warnings), encoding="utf-8")
             return b"", validation_txt.read_text(encoding="utf-8"), warnings
-        update_ppt(str(DEFAULT_TEMPLATE), str(output_pptx), ctx)
+        update_ppt(str(DEFAULT_TEMPLATE), str(output_pptx), ctx, asset_service_account_info=asset_service_account_info)
         write_validation_report(validation_txt, ctx)
         return output_pptx.read_bytes(), validation_txt.read_text(encoding="utf-8"), warnings
 
@@ -323,10 +329,11 @@ def render_hero() -> None:
         <div class="hero">
             <div class="eyebrow">Reporting automation · Maicao</div>
             <h1>Maicao Reporting Studio</h1>
-            <p>Conecta la data mensual, revisa un preview ejecutivo y exporta una presentación editable lista para compartir.</p>
+            <p>Conecta la data mensual, revisa preview de KPIs, textos y piezas visuales, y exporta una presentación editable lista para compartir.</p>
             <div class="pill-row">
                 <span class="pill">✨ Diseño visual ejecutivo</span>
                 <span class="pill">📊 Preview antes de descargar</span>
+                <span class="pill">🖼️ Top 3 + assets visuales</span>
                 <span class="pill">📎 PowerPoint editable</span>
             </div>
         </div>
@@ -440,38 +447,68 @@ def render_chart_previews(ctx: Dict[str, Any]) -> None:
         st.bar_chart(chart_df(ctx, "slide9_er", ["Skarleth", "Busquilla", "Cami", "Disley"]), height=260)
 
 
-def resolve_preview_text(ctx: Dict[str, Any], key_spec: Any) -> str:
-    """Resolve a text preview item.
-
-    key_spec can be a string key or a list of keys. Lists are useful when one
-    visible text block in the PPT is built from multiple rows in
-    15_Qualitative_Texts, for example Instagram "Qué funcionó".
-    """
-    if isinstance(key_spec, (list, tuple)):
-        # If a consolidated key exists, prefer it. Otherwise join bullet keys.
-        first = ctx.get(key_spec[0]) if key_spec else None
-        if first and first != "Dato pendiente":
-            return str(first)
-        parts = []
-        for k in key_spec[1:]:
-            val = ctx.get(k)
-            if val and val != "Dato pendiente":
-                parts.append(str(val))
-        return "\n".join(parts) if parts else "Dato pendiente"
-    return ctx.get(key_spec, "Dato pendiente")
-
-
 def render_text_previews(ctx: Dict[str, Any]) -> None:
     st.markdown('<div class="section-title">Textos cualitativos que irán al PPT</div>', unsafe_allow_html=True)
     rows = []
     for section, title, key in TEXT_PREVIEW_KEYS:
-        rows.append((section, title, resolve_preview_text(ctx, key)))
+        rows.append((section, title, ctx.get(key, "Dato pendiente")))
     for i in range(0, len(rows), 2):
         cols = st.columns(2)
         for col, item in zip(cols, rows[i : i + 2]):
             with col:
                 st.markdown(text_preview_card(*item), unsafe_allow_html=True)
 
+
+
+
+def render_media_card(item: Dict[str, Any]) -> None:
+    title = item.get("content_title") or item.get("title") or "Pieza"
+    url = item.get("asset_url") or item.get("image_url") or ""
+    note = item.get("short_note") or item.get("note") or ""
+    st.markdown('<div class="media-card">', unsafe_allow_html=True)
+    if url and "..." not in str(url):
+        try:
+            st.image(url, use_container_width=True)
+        except Exception:
+            st.info("Imagen configurada; se verá en la presentación si el link es accesible.")
+    else:
+        st.info("Asset pendiente: agrega link de imagen en Google Sheets.")
+    st.markdown(f'<div class="media-title">{escape(title)}</div>', unsafe_allow_html=True)
+    metric = item.get("rank_metric_label") or ""
+    value = item.get("rank_value")
+    if value not in [None, ""]:
+        st.markdown(f'<div class="media-meta">Ranking: {escape(metric)} · {escape(value)}</div>', unsafe_allow_html=True)
+    if note:
+        st.caption(str(note))
+    st.markdown('</div>', unsafe_allow_html=True)
+
+
+def render_media_previews(ctx: Dict[str, Any]) -> None:
+    st.markdown('<div class="section-title">Contenido visual y assets</div>', unsafe_allow_html=True)
+    top3 = ctx.get("_TOP3_MEDIA", {}) or {}
+    if not top3:
+        st.info("No se detectaron piezas para Top 3. Revisa 01_Content_Raw y 00_Control.")
+        return
+    for platform in ["Instagram", "Facebook", "TikTok"]:
+        st.markdown(f"**Top 3 {platform}**")
+        cols = st.columns(3)
+        for col, item in zip(cols, top3.get(platform, []) + [{}] * 3):
+            with col:
+                render_media_card(item)
+        st.write("")
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("**MMPP · imágenes del mes**")
+        assets = ctx.get("_MMPP_ASSETS", []) or []
+        cols = st.columns(2)
+        for col, item in zip(cols, assets + [{}] * 2):
+            with col:
+                render_media_card(item)
+    with c2:
+        st.markdown("**Competencia · assets curados**")
+        comp = (ctx.get("_COMPETITION_ASSETS", []) or [])[:4]
+        for item in comp:
+            st.caption(f"{item.get('brand','Marca')} · {item.get('display_group','Acción')}: {item.get('title','')}")
 
 def render_validation(ctx: Optional[Dict[str, Any]]) -> None:
     st.markdown('<div class="section-title">Validación</div>', unsafe_allow_html=True)
@@ -494,6 +531,7 @@ def load_source_to_session(source: str, sheet_url: str, uploaded_excel: Optional
         tmpdir_path = Path(tmpdir)
         if source == "Google Sheets":
             sa_info = get_service_account_info(sa_file)
+            st.session_state["asset_service_account_info"] = sa_info
             p = google_sheet_to_xlsx(sheet_url, sa_info, tmpdir_path / "google_sheet_input.xlsx")
             xlsx_bytes = p.read_bytes()
             source_name = "Google Sheets"
@@ -505,6 +543,7 @@ def load_source_to_session(source: str, sheet_url: str, uploaded_excel: Optional
             else:
                 xlsx_bytes = DEFAULT_EXCEL.read_bytes()
                 source_name = "Modelo incluido"
+            st.session_state.setdefault("asset_service_account_info", None)
         ctx, missing_sheets = analyze_xlsx(xlsx_bytes)
         st.session_state["xlsx_bytes"] = xlsx_bytes
         st.session_state["ctx"] = ctx
@@ -586,6 +625,7 @@ def render_preview_tab() -> None:
     st.markdown('<div class="section-title">Plataformas</div>', unsafe_allow_html=True)
     render_platform_table(ctx)
     render_chart_previews(ctx)
+    render_media_previews(ctx)
     render_text_previews(ctx)
     render_validation(ctx)
 
@@ -604,6 +644,7 @@ def render_export_tab() -> None:
             ppt_bytes, validation_text, warnings = generate_ppt_from_bytes(
                 st.session_state["xlsx_bytes"],
                 strict=bool(st.session_state.get("strict_mode", False)),
+                asset_service_account_info=st.session_state.get("asset_service_account_info"),
             )
             st.session_state["ppt_bytes"] = ppt_bytes
             st.session_state["validation_text"] = validation_text
@@ -639,7 +680,8 @@ def render_help_tab() -> None:
         2. Completar los textos cualitativos en <code>15_Qualitative_Texts</code>.<br>
         3. Completar el plan de acción en <code>16_Action_Plan</code>.<br>
         4. Conectar el Sheet en esta app y revisar el preview.<br>
-        5. Generar y descargar la presentación editable.<br><br>
+        5. Completar links de imágenes en <code>01_Content_Raw</code>, <code>21_MMPP_Assets</code> y <code>22_Competition_Assets</code>.<br>
+        6. Revisar preview visual y descargar la presentación editable.<br><br>
         <span style="color:#74788A;">Tip: si algo no aparece en el preview, probablemente falta en el Google Sheet o el mes activo no coincide con <code>00_Control</code>.</span>
         </div>
         """,
@@ -663,7 +705,7 @@ def main() -> None:
     with tabs[3]:
         render_help_tab()
 
-    st.markdown('<div class="footer-note">Maicao Reporting Studio · Google Sheets → Preview → PowerPoint editable</div>', unsafe_allow_html=True)
+    st.markdown('<div class="footer-note">Maicao Reporting Studio · Google Sheets → Preview visual → PowerPoint editable</div>', unsafe_allow_html=True)
 
 
 if __name__ == "__main__":
