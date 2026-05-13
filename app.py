@@ -1,8 +1,8 @@
 """
-Maicao Reporting Studio v12
+Maicao Reporting Studio v13
 
 Professional Streamlit UI for generating the Maicao monthly PPT report from
-Google Sheets or an uploaded Excel model, with preview/QA before download.
+Google Sheets or an uploaded Excel model, with final slide preview and report history.
 """
 from __future__ import annotations
 
@@ -11,6 +11,8 @@ import io
 import json
 import re
 import tempfile
+import uuid
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
@@ -19,11 +21,13 @@ import streamlit as st
 from openpyxl import Workbook, load_workbook
 
 from generate_report_from_template import build_context, update_ppt, write_validation_report
+from preview_utils import render_pptx_to_images
+from history_utils import append_history_row, get_history_df, upload_report_to_drive, utc_now_iso
 
 ROOT = Path(__file__).resolve().parent
-DEFAULT_EXCEL = ROOT / "Maicao_Reporte_Input_Model_v12_MEDIA_BLUEPRINT.xlsx"
+DEFAULT_EXCEL = ROOT / "Maicao_Reporte_Input_Model_v13_MEDIA_HISTORY.xlsx"
 DEFAULT_TEMPLATE = ROOT / "template" / "Maicao_Template_Visual_v02.pptx"
-DEFAULT_OUTPUT_NAME = "Maicao_Reporte_Mensual_Maicao_v12.pptx"
+DEFAULT_OUTPUT_NAME = "Maicao_Reporte_Mensual_Maicao_v13.pptx"
 
 REQUIRED_SHEETS = [
     "00_Control",
@@ -329,11 +333,12 @@ def render_hero() -> None:
         <div class="hero">
             <div class="eyebrow">Reporting automation · Maicao</div>
             <h1>Maicao Reporting Studio</h1>
-            <p>Conecta la data mensual, revisa preview de KPIs, textos y piezas visuales, y exporta una presentación editable lista para compartir.</p>
+            <p>Conecta la data mensual, genera un preview real de la presentación final, guarda historial de reportes y descarga un PowerPoint editable listo para compartir.</p>
             <div class="pill-row">
                 <span class="pill">✨ Diseño visual ejecutivo</span>
-                <span class="pill">📊 Preview antes de descargar</span>
-                <span class="pill">🖼️ Top 3 + assets visuales</span>
+                <span class="pill">📊 Preview final de slides</span>
+                <span class="pill">🖼️ Media assets + Top 3</span>
+                <span class="pill">🗂️ Historial de reportes</span>
                 <span class="pill">📎 PowerPoint editable</span>
             </div>
         </div>
@@ -532,6 +537,8 @@ def load_source_to_session(source: str, sheet_url: str, uploaded_excel: Optional
         if source == "Google Sheets":
             sa_info = get_service_account_info(sa_file)
             st.session_state["asset_service_account_info"] = sa_info
+            st.session_state["spreadsheet_url"] = sheet_url
+            st.session_state["spreadsheet_id"] = extract_sheet_id(sheet_url)
             p = google_sheet_to_xlsx(sheet_url, sa_info, tmpdir_path / "google_sheet_input.xlsx")
             xlsx_bytes = p.read_bytes()
             source_name = "Google Sheets"
@@ -544,6 +551,8 @@ def load_source_to_session(source: str, sheet_url: str, uploaded_excel: Optional
                 xlsx_bytes = DEFAULT_EXCEL.read_bytes()
                 source_name = "Modelo incluido"
             st.session_state.setdefault("asset_service_account_info", None)
+            st.session_state.pop("spreadsheet_url", None)
+            st.session_state.pop("spreadsheet_id", None)
         ctx, missing_sheets = analyze_xlsx(xlsx_bytes)
         st.session_state["xlsx_bytes"] = xlsx_bytes
         st.session_state["ctx"] = ctx
@@ -551,6 +560,8 @@ def load_source_to_session(source: str, sheet_url: str, uploaded_excel: Optional
         st.session_state["missing_sheets"] = missing_sheets
         st.session_state.pop("ppt_bytes", None)
         st.session_state.pop("validation_text", None)
+        st.session_state.pop("slide_preview_images", None)
+        st.session_state.pop("preview_error", None)
 
 
 def render_connect_tab() -> None:
@@ -630,6 +641,163 @@ def render_preview_tab() -> None:
     render_validation(ctx)
 
 
+
+
+def sanitize_filename_part(value: Any) -> str:
+    text = re.sub(r"[^A-Za-z0-9_-]+", "_", str(value or "reporte")).strip("_")
+    return text or "reporte"
+
+
+def build_report_filename(ctx: Dict[str, Any], suffix: str = "") -> str:
+    month = sanitize_filename_part(ctx.get("MES", "reporte"))
+    stamp = datetime.now().strftime("%Y%m%d_%H%M")
+    extra = f"_{suffix}" if suffix else ""
+    return f"Maicao_Reporte_{month}_{stamp}{extra}.pptx"
+
+
+def generate_ppt_and_preview(strict: bool = False) -> None:
+    ppt_bytes, validation_text, warnings = generate_ppt_from_bytes(
+        st.session_state["xlsx_bytes"],
+        strict=strict,
+        asset_service_account_info=st.session_state.get("asset_service_account_info"),
+    )
+    st.session_state["ppt_bytes"] = ppt_bytes
+    st.session_state["validation_text"] = validation_text
+    st.session_state["export_warnings"] = warnings
+    st.session_state["slide_preview_images"] = []
+    st.session_state["preview_error"] = None
+    if ppt_bytes:
+        images, error = render_pptx_to_images(ppt_bytes)
+        st.session_state["slide_preview_images"] = images
+        st.session_state["preview_error"] = error
+
+
+def render_slide_gallery() -> None:
+    images = st.session_state.get("slide_preview_images") or []
+    error = st.session_state.get("preview_error")
+    if error:
+        st.warning(error)
+        st.caption("La descarga PPT sigue disponible aunque no se pueda renderizar el preview final.")
+    if not images:
+        st.info("Genera un preview final para ver las slides aquí.")
+        return
+    st.markdown('<div class="section-title">Preview final de la presentación</div>', unsafe_allow_html=True)
+    st.caption("Esta galería se genera desde el PowerPoint final. Si algo se ve aquí, así saldrá en el archivo descargable.")
+    for i in range(0, len(images), 2):
+        cols = st.columns(2)
+        for offset, col in enumerate(cols):
+            idx = i + offset
+            if idx < len(images):
+                with col:
+                    st.image(images[idx], caption=f"Slide {idx + 1}", use_container_width=True)
+
+
+def render_final_preview_tab() -> None:
+    ctx = st.session_state.get("ctx")
+    if not ctx:
+        st.info("Primero conecta y analiza una fuente de datos en la pestaña Conectar.")
+        return
+    st.markdown('<div class="section-title">Preview real del PowerPoint final</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="help-box">Este preview renderiza la presentación final como imágenes. Úsalo para revisar textos, assets, barras y posibles montajes antes de descargar.</div>',
+        unsafe_allow_html=True,
+    )
+    c1, c2 = st.columns([1, 2])
+    with c1:
+        if st.button("Generar preview final", type="primary", use_container_width=True):
+            try:
+                with st.spinner("Generando PowerPoint y renderizando slides..."):
+                    generate_ppt_and_preview(strict=bool(st.session_state.get("strict_mode", False)))
+                if st.session_state.get("ppt_bytes"):
+                    st.success("Preview generado correctamente.")
+                else:
+                    st.warning("No se generó PPT porque la validación estricta encontró alertas.")
+            except Exception as exc:
+                st.error(str(exc))
+    with c2:
+        if st.session_state.get("ppt_bytes"):
+            st.markdown('<span class="success-badge">✓ PPT generado en sesión</span>', unsafe_allow_html=True)
+        else:
+            st.markdown('<span class="neutral-badge">Genera el preview para crear el PPT temporal</span>', unsafe_allow_html=True)
+    render_slide_gallery()
+
+
+def render_history_controls() -> None:
+    ctx = st.session_state.get("ctx") or {}
+    if not st.session_state.get("ppt_bytes"):
+        st.info("Primero genera un preview final o crea el PowerPoint en la pestaña Exportar.")
+        return
+    sa_info = st.session_state.get("asset_service_account_info")
+    spreadsheet_id = st.session_state.get("spreadsheet_id")
+    if not (sa_info and spreadsheet_id):
+        st.info("El historial persistente requiere usar Google Sheets como fuente y tener credenciales configuradas.")
+        return
+    with st.expander("Guardar copia en historial", expanded=True):
+        st.caption("Para guardar el PPT en Drive, comparte la carpeta destino con el service account. Para registrar historial en el Sheet, el service account debe tener permiso Editor en el Google Sheet.")
+        default_folder = ""
+        try:
+            default_folder = st.secrets.get("history_drive_folder_id", "")
+        except Exception:
+            default_folder = ""
+        folder_id = st.text_input("ID de carpeta Drive para guardar PPT (opcional)", value=default_folder, placeholder="Pega el folder ID de Drive")
+        notes = st.text_input("Notas de versión", placeholder="Ej: feedback agencia aplicado / versión para revisión")
+        if st.button("Guardar en historial", use_container_width=True):
+            try:
+                ppt_bytes = st.session_state["ppt_bytes"]
+                filename = build_report_filename(ctx)
+                ppt_url = ""
+                ppt_file_id = ""
+                if folder_id.strip():
+                    uploaded = upload_report_to_drive(ppt_bytes, filename, sa_info, folder_id.strip())
+                    ppt_url = uploaded.get("webViewLink", "")
+                    ppt_file_id = uploaded.get("id", "")
+                row = {
+                    "report_id": str(uuid.uuid4())[:8],
+                    "client": ctx.get("CLIENTE", "Maicao"),
+                    "month": ctx.get("MES", ""),
+                    "generated_at_utc": utc_now_iso(),
+                    "version": "v13",
+                    "source": st.session_state.get("source_name", ""),
+                    "filename": filename,
+                    "status": "Generado",
+                    "warnings_count": len(st.session_state.get("export_warnings") or []),
+                    "ppt_drive_url": ppt_url,
+                    "ppt_file_id": ppt_file_id,
+                    "notes": notes,
+                }
+                append_history_row(spreadsheet_id, sa_info, row)
+                st.success("Historial actualizado correctamente.")
+                if ppt_url:
+                    st.link_button("Abrir PPT guardado en Drive", ppt_url)
+            except Exception as exc:
+                st.error(f"No pude guardar historial: {exc}")
+
+
+def render_history_tab() -> None:
+    st.markdown('<div class="section-title">Historial de reportes</div>', unsafe_allow_html=True)
+    sa_info = st.session_state.get("asset_service_account_info")
+    spreadsheet_id = st.session_state.get("spreadsheet_id")
+    if not (sa_info and spreadsheet_id):
+        st.info("Conecta un Google Sheet para ver el historial persistente del reporte.")
+        return
+    c1, c2 = st.columns([1, 2])
+    with c1:
+        refresh = st.button("Actualizar historial", use_container_width=True)
+    try:
+        df = get_history_df(spreadsheet_id, sa_info)
+        if df.empty:
+            st.info("Aún no hay reportes guardados en historial.")
+        else:
+            view = df.copy()
+            cols = ["month", "generated_at_utc", "version", "status", "warnings_count", "ppt_drive_url", "notes"]
+            st.dataframe(view[cols], hide_index=True, use_container_width=True)
+            urls = [u for u in df.get("ppt_drive_url", []) if isinstance(u, str) and u.strip()]
+            if urls:
+                st.caption("Último reporte guardado en Drive:")
+                st.link_button("Abrir último PPT", urls[-1])
+    except Exception as exc:
+        st.error(f"No pude leer historial. Revisa que el service account tenga permiso Editor en el Google Sheet. Detalle: {exc}")
+
 def render_export_tab() -> None:
     ctx = st.session_state.get("ctx")
     if not ctx:
@@ -637,24 +805,22 @@ def render_export_tab() -> None:
         return
     render_validation(ctx)
     st.write("")
-    st.markdown('<div class="section-title">Crear presentación editable</div>', unsafe_allow_html=True)
-    st.caption("La presentación se genera con la plantilla visual aprobada y los datos actualmente cargados.")
-    if st.button("Crear PowerPoint", type="primary"):
-        try:
-            ppt_bytes, validation_text, warnings = generate_ppt_from_bytes(
-                st.session_state["xlsx_bytes"],
-                strict=bool(st.session_state.get("strict_mode", False)),
-                asset_service_account_info=st.session_state.get("asset_service_account_info"),
-            )
-            st.session_state["ppt_bytes"] = ppt_bytes
-            st.session_state["validation_text"] = validation_text
-            st.session_state["export_warnings"] = warnings
-            if ppt_bytes:
-                st.success("Presentación creada correctamente.")
-            else:
-                st.warning("La presentación no se generó porque la validación estricta encontró alertas.")
-        except Exception as exc:
-            st.error(str(exc))
+    st.markdown('<div class="section-title">Exportar presentación editable</div>', unsafe_allow_html=True)
+    st.caption("Puedes generar el PPT desde aquí o usar la pestaña Preview final para revisar las slides antes de descargar.")
+    c1, c2 = st.columns([1, 2])
+    with c1:
+        if st.button("Crear PowerPoint", type="primary", use_container_width=True):
+            try:
+                with st.spinner("Creando presentación..."):
+                    generate_ppt_and_preview(strict=bool(st.session_state.get("strict_mode", False)))
+                if st.session_state.get("ppt_bytes"):
+                    st.success("Presentación creada correctamente.")
+                else:
+                    st.warning("La presentación no se generó porque la validación estricta encontró alertas.")
+            except Exception as exc:
+                st.error(str(exc))
+    with c2:
+        st.markdown('<span class="neutral-badge">Tip: usa Preview final para revisar las slides renderizadas antes de enviar.</span>', unsafe_allow_html=True)
 
     if st.session_state.get("validation_text"):
         with st.expander("Ver reporte técnico de validación", expanded=False):
@@ -664,10 +830,11 @@ def render_export_tab() -> None:
         st.download_button(
             "Descargar presentación editable",
             data=st.session_state["ppt_bytes"],
-            file_name=DEFAULT_OUTPUT_NAME,
+            file_name=build_report_filename(ctx),
             mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
             use_container_width=True,
         )
+        render_history_controls()
 
 
 def render_help_tab() -> None:
@@ -681,8 +848,9 @@ def render_help_tab() -> None:
         3. Completar el plan de acción en <code>16_Action_Plan</code>.<br>
         4. Conectar el Sheet en esta app y revisar el preview.<br>
         5. Completar links de imágenes en <code>01_Content_Raw</code>, <code>21_MMPP_Assets</code> y <code>22_Competition_Assets</code>.<br>
-        6. Revisar preview visual y descargar la presentación editable.<br><br>
-        <span style="color:#74788A;">Tip: si algo no aparece en el preview, probablemente falta en el Google Sheet o el mes activo no coincide con <code>00_Control</code>.</span>
+        6. Generar <b>Preview final</b> para revisar el deck como imágenes antes de descargar.<br>
+        7. Descargar la presentación editable y, si aplica, guardarla en historial.<br><br>
+        <span style="color:#74788A;">Tip: el preview final sale desde el PowerPoint generado, por eso es la revisión más confiable antes de enviar.</span>
         </div>
         """,
         unsafe_allow_html=True,
@@ -695,17 +863,21 @@ def main() -> None:
     render_hero()
     render_status_strip(st.session_state.get("ctx"))
 
-    tabs = st.tabs(["Conectar", "Preview", "Exportar", "Ayuda"])
+    tabs = st.tabs(["Conectar", "Preview datos", "Preview final", "Exportar", "Historial", "Ayuda"])
     with tabs[0]:
         render_connect_tab()
     with tabs[1]:
         render_preview_tab()
     with tabs[2]:
-        render_export_tab()
+        render_final_preview_tab()
     with tabs[3]:
+        render_export_tab()
+    with tabs[4]:
+        render_history_tab()
+    with tabs[5]:
         render_help_tab()
 
-    st.markdown('<div class="footer-note">Maicao Reporting Studio · Google Sheets → Preview visual → PowerPoint editable</div>', unsafe_allow_html=True)
+    st.markdown('<div class="footer-note">Maicao Reporting Studio · Google Sheets → Preview final → Historial → PowerPoint editable</div>', unsafe_allow_html=True)
 
 
 if __name__ == "__main__":

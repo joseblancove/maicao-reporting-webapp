@@ -15,7 +15,7 @@ Uso Terminal:
   python3 generate_report_from_template.py
 
 Salida default:
-  output/Maicao_Reporte_Auto_Template_v12.pptx
+  output/Maicao_Reporte_Auto_Template_v13.pptx
 """
 import argparse, json, re, sys
 from pathlib import Path
@@ -1109,7 +1109,7 @@ def write_validation_report(path, ctx):
     warnings = ctx.get('_WARNINGS', [])
     bar_diags = ctx.get('_BAR_DIAGNOSTICS', [])
     lines = []
-    lines.append("VALIDACION MAICAO REPORTING STUDIO v12")
+    lines.append("VALIDACION MAICAO REPORTING STUDIO v13")
     lines.append(f"Mes: {ctx.get('MES')}")
     lines.append("")
     if warnings:
@@ -1146,14 +1146,14 @@ def write_validation_report(path, ctx):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--input', default=str(ROOT / 'Maicao_Reporte_Input_Model_v12_MEDIA_BLUEPRINT.xlsx'))
+    ap.add_argument('--input', default=str(ROOT / 'Maicao_Reporte_Input_Model_v13_MEDIA_HISTORY.xlsx'))
     ap.add_argument('--template', default=str(ROOT / 'template' / 'Maicao_Template_Visual_v02.pptx'))
-    ap.add_argument('--output', default=str(ROOT / 'output' / 'Maicao_Reporte_Auto_Template_v12.pptx'))
+    ap.add_argument('--output', default=str(ROOT / 'output' / 'Maicao_Reporte_Auto_Template_v13.pptx'))
     ap.add_argument('--strict', action='store_true', help='Detener generacion si hay datos obligatorios faltantes.')
     args = ap.parse_args()
     ctx = build_context(args.input)
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
-    report_path = Path(args.output).parent / 'validation_report_v12.txt'
+    report_path = Path(args.output).parent / 'validation_report_v13.txt'
 
     warnings = ctx.get('_WARNINGS', [])
     if warnings:
