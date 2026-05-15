@@ -1,5 +1,5 @@
 """
-Maicao Reporting Studio v14 · Team-Friendly
+Maicao Reporting Studio v14.2 · Team-Friendly
 
 Professional Streamlit UI for generating the Maicao monthly PPT report from
 Google Sheets or an uploaded Excel model, with final slide preview and report history.
@@ -28,7 +28,7 @@ from team_friendly_adapter import convert_team_friendly_to_legacy
 ROOT = Path(__file__).resolve().parent
 DEFAULT_EXCEL = ROOT / "Maicao_Reporte_Input_Model_v14_TEAM_FRIENDLY.xlsx"
 DEFAULT_TEMPLATE = ROOT / "template" / "Maicao_Template_Visual_v02.pptx"
-DEFAULT_OUTPUT_NAME = "Maicao_Reporte_Mensual_Maicao_v14.pptx"
+DEFAULT_OUTPUT_NAME = "Maicao_Reporte_Mensual_Maicao_v14_2.pptx"
 
 REQUIRED_SHEETS = [
     "S01_Portada",
@@ -758,7 +758,7 @@ def render_history_controls() -> None:
                     "client": ctx.get("CLIENTE", "Maicao"),
                     "month": ctx.get("MES", ""),
                     "generated_at_utc": utc_now_iso(),
-                    "version": "v13",
+                    "version": "v14.2",
                     "source": st.session_state.get("source_name", ""),
                     "filename": filename,
                     "status": "Generado",
