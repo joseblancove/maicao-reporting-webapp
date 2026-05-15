@@ -300,6 +300,14 @@ def build_asset_rows(wb, sheet: str, month: str, include_month=True) -> List[Dic
 
 
 def enrich_media_context(wb, ctx: Dict[str, Any], month: str, ctrl: Dict[str, Any], warnings: List[str]) -> Dict[str, Any]:
+    enable_media = _norm_bool(ctrl.get("enable_media_slides") or ctrl.get("use_assets_ppt") or False)
+    ctx["_ENABLE_MEDIA_SLIDES"] = enable_media
+    if not enable_media:
+        ctx["_TOP3_MEDIA"] = {}
+        ctx["_SQUAD_ASSETS"] = []
+        ctx["_MMPP_ASSETS"] = []
+        ctx["_COMPETITION_ASSETS"] = []
+        return ctx
     ctx["_TOP3_MEDIA"] = build_top3_media(wb, month, warnings)
     ctx["_SQUAD_ASSETS"] = build_asset_rows(wb, "20_Squad_Assets", month, include_month=False)
     ctx["_MMPP_ASSETS"] = build_asset_rows(wb, "21_MMPP_Assets", month, include_month=True)[:2]
@@ -410,6 +418,8 @@ def append_competition_assets_slide(prs, context, tmpdir: Path, service_account_
 
 
 def append_media_slides(prs, context: Dict[str, Any], service_account_info: Optional[Dict[str, Any]] = None) -> int:
+    if not context.get("_ENABLE_MEDIA_SLIDES"):
+        return 0
     with tempfile.TemporaryDirectory() as t:
         tmpdir = Path(t)
         before = len(prs.slides)

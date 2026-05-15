@@ -1,5 +1,5 @@
 """
-Maicao Reporting Studio v13
+Maicao Reporting Studio v14 · Team-Friendly
 
 Professional Streamlit UI for generating the Maicao monthly PPT report from
 Google Sheets or an uploaded Excel model, with final slide preview and report history.
@@ -23,28 +23,26 @@ from openpyxl import Workbook, load_workbook
 from generate_report_from_template import build_context, update_ppt, write_validation_report
 from preview_utils import render_pptx_to_images
 from history_utils import append_history_row, get_history_df, upload_report_to_drive, utc_now_iso
+from team_friendly_adapter import convert_team_friendly_to_legacy
 
 ROOT = Path(__file__).resolve().parent
-DEFAULT_EXCEL = ROOT / "Maicao_Reporte_Input_Model_v13_MEDIA_HISTORY.xlsx"
+DEFAULT_EXCEL = ROOT / "Maicao_Reporte_Input_Model_v14_TEAM_FRIENDLY.xlsx"
 DEFAULT_TEMPLATE = ROOT / "template" / "Maicao_Template_Visual_v02.pptx"
-DEFAULT_OUTPUT_NAME = "Maicao_Reporte_Mensual_Maicao_v13.pptx"
+DEFAULT_OUTPUT_NAME = "Maicao_Reporte_Mensual_Maicao_v14.pptx"
 
 REQUIRED_SHEETS = [
-    "00_Control",
-    "01_Content_Raw",
-    "02_Audience",
-    "03_Paid_Media",
-    "04_Squad",
-    "05_MMPP",
-    "06_Competencia",
-    "09_Validaciones",
-    "13_Platform_KPIs",
-    "15_Qualitative_Texts",
-    "16_Action_Plan",
-    "20_Squad_Assets",
-    "21_MMPP_Assets",
-    "22_Competition_Assets",
-    "23_Content_Notes",
+    "S01_Portada",
+    "S02_Dashboard",
+    "S03_Que_Cambio",
+    "S04_Portafolio_Canales",
+    "S05_Instagram",
+    "S06_Facebook",
+    "S07_TikTok",
+    "S08_TikTok_Mix",
+    "S09_Squad",
+    "S10_MMPP",
+    "S11_Competencia",
+    "S12_Plan_30_Dias",
 ]
 
 KPI_ORDER = [
@@ -303,10 +301,12 @@ def analyze_xlsx(xlsx_bytes: bytes) -> Tuple[Dict[str, Any], list[str]]:
     with tempfile.TemporaryDirectory() as tmpdir:
         p = Path(tmpdir) / "input.xlsx"
         p.write_bytes(xlsx_bytes)
-        ctx = build_context(str(p))
+        legacy_p = Path(tmpdir) / "legacy_model.xlsx"
+        model_p = convert_team_friendly_to_legacy(p, legacy_p)
+        ctx = build_context(str(model_p))
         missing = sheet_name_check(p)
         if missing:
-            ctx.setdefault("_WARNINGS", []).append("Faltan hojas: " + ", ".join(missing))
+            ctx.setdefault("_WARNINGS", []).append("Faltan hojas team-friendly: " + ", ".join(missing))
         return ctx, missing
 
 
@@ -314,10 +314,12 @@ def generate_ppt_from_bytes(xlsx_bytes: bytes, strict: bool = False, asset_servi
     with tempfile.TemporaryDirectory() as tmpdir:
         tmpdir_path = Path(tmpdir)
         input_xlsx = tmpdir_path / "input.xlsx"
+        legacy_xlsx = tmpdir_path / "legacy_model.xlsx"
         output_pptx = tmpdir_path / DEFAULT_OUTPUT_NAME
         validation_txt = tmpdir_path / "validation_report.txt"
         input_xlsx.write_bytes(xlsx_bytes)
-        ctx = build_context(str(input_xlsx))
+        model_xlsx = convert_team_friendly_to_legacy(input_xlsx, legacy_xlsx)
+        ctx = build_context(str(model_xlsx))
         warnings = ctx.get("_WARNINGS", [])
         if strict and warnings:
             validation_txt.write_text("VALIDACION: REVISAR\n\n" + "\n".join(f"- {w}" for w in warnings), encoding="utf-8")
@@ -333,11 +335,11 @@ def render_hero() -> None:
         <div class="hero">
             <div class="eyebrow">Reporting automation · Maicao</div>
             <h1>Maicao Reporting Studio</h1>
-            <p>Conecta la data mensual, genera un preview real de la presentación final, guarda historial de reportes y descarga un PowerPoint editable listo para compartir.</p>
+            <p>El equipo completa una hoja por slide, revisa el preview final y descarga un PowerPoint editable sin tocar código ni plantillas técnicas.</p>
             <div class="pill-row">
                 <span class="pill">✨ Diseño visual ejecutivo</span>
                 <span class="pill">📊 Preview final de slides</span>
-                <span class="pill">🖼️ Media assets + Top 3</span>
+                <span class="pill">🖼️ Sheet por slide</span>
                 <span class="pill">🗂️ Historial de reportes</span>
                 <span class="pill">📎 PowerPoint editable</span>
             </div>
@@ -390,7 +392,7 @@ def render_status_strip(ctx: Optional[Dict[str, Any]]) -> None:
     else:
         warnings = ctx.get("_WARNINGS", [])
         items = [
-            ("Estado", "Conectado", "Data cargada correctamente"),
+            ("Estado", "Conectado", "Sheet team-friendly cargado"),
             ("Mes activo", ctx.get("MES", "—"), "Desde 00_Control"),
             ("Validación", "Revisar" if warnings else "OK", f"{len(warnings)} alertas" if warnings else "Sin alertas críticas"),
             ("Salida", "PPT editable", "Lista para generar"),
@@ -877,7 +879,7 @@ def main() -> None:
     with tabs[5]:
         render_help_tab()
 
-    st.markdown('<div class="footer-note">Maicao Reporting Studio · Google Sheets → Preview final → Historial → PowerPoint editable</div>', unsafe_allow_html=True)
+    st.markdown('<div class="footer-note">Maicao Reporting Studio · Sheet por slide → Preview final → Historial → PowerPoint editable</div>', unsafe_allow_html=True)
 
 
 if __name__ == "__main__":
